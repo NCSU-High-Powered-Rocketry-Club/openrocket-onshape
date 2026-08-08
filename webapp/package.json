@@ -1,0 +1,22 @@
+{
+  "name": "openrocket-onshape-webapp",
+  "version": "0.1.0",
+  "description": "Static web app that converts OpenRocket .ork files to JSON for Onshape custom feature",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^4.4.0",
+    "jszip": "^3.10.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^5.4.5",
+    "vite": "^5.2.0",
+    "vitest": "^4.1.10"
+  }
+}

@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenRocket → Onshape Converter</title>
+  <style>
+    :root {
+      --bg: #1e1e2e;
+      --panel: #2a2a3d;
+      --border: #3a3a55;
+      --text: #e0e0f0;
+      --muted: #9a9ab0;
+      --accent: #7f9cf5;
+      --success: #6ee7b7;
+      --error: #f87171;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      padding: 1rem 2rem;
+      background: linear-gradient(135deg, #2c2c44, #20203a);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    header h1 { font-size: 1.25rem; margin: 0; font-weight: 600; }
+    header .badge {
+      background: var(--accent);
+      color: #fff;
+      padding: 0.15rem 0.6rem;
+      border-radius: 999px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+    }
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 2rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.5rem 2rem;
+    }
+    .card h2 { margin: 0 0 0.75rem; font-size: 1.1rem; }
+    .card p { margin: 0.25rem 0 0.75rem; color: var(--muted); font-size: 0.9rem; }
+    .row { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 0.55rem 1.25rem;
+      font-size: 0.95rem;
+      cursor: pointer;
+      transition: opacity 0.15s;
+      font-weight: 500;
+    }
+    button:hover { opacity: 0.85; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button.secondary { background: #4a4a6a; }
+    input[type="file"] {
+      background: transparent;
+      color: var(--muted);
+      flex: 1;
+    }
+    .drop {
+      border: 2px dashed var(--border);
+      border-radius: 8px;
+      padding: 2.5rem;
+      text-align: center;
+      color: var(--muted);
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+    .drop:hover { border-color: var(--accent); }
+    .drop b { color: var(--text); }
+    code, pre {
+      font-family: "SFMono-Regular", Consolas, monospace;
+    }
+    pre {
+      background: #18182b;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1rem;
+      overflow: auto;
+      max-height: 400px;
+      font-size: 0.8rem;
+      white-space: pre;
+    }
+    .status { font-size: 0.9rem; }
+    .status.ok { color: var(--success); }
+    .status.err { color: var(--error); }
+    #summaryGrid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 0.5rem;
+      margin-top: 0.5rem;
+    }
+    #summaryGrid div {
+      background: #18182b;
+      padding: 0.75rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+    }
+    #summaryGrid .k { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    #summaryGrid .v { font-size: 1rem; font-weight: 600; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>OpenRocket → Onshape</h1>
+    <span class="badge">BETA</span>
+  </header>
+  <main>
+    <section class="card">
+      <h2>Upload .ork file</h2>
+      <p>Select an OpenRocket design file or drag & drop it here. The app parses it locally in your browser — nothing is uploaded until you push to Onshape.</p>
+      <div id="dropZone" class="drop">
+        <p><b>Drop your .ork file here</b> or click to browse</p>
+      </div>
+      <input type="file" id="fileInput" accept=".ork" class="hidden" />
+    </section>
+
+    <section class="card hidden" id="summaryCard">
+      <h2>Parsed Design</h2>
+      <div id="summaryGrid"></div>
+    </section>
+
+    <section class="card hidden" id="outputCard">
+      <h2>Generated JSON</h2>
+      <p>This JSON is what the Onshape custom feature expects.</p>
+      <pre id="jsonOutput"></pre>
+      <div class="row">
+        <button id="downloadBtn" class="secondary">Download JSON</button>
+      </div>
+    </section>
+
+    <section class="card hidden" id="onshapeCard">
+      <h2>Upload to Onshape</h2>
+      <p>Provide your Onshape API credentials (OAuth2 bearer token) to create a document from this rocket.</p>
+      <div class="row">
+        <input type="password" id="tokenInput" placeholder="Onshape Bearer Token" style="flex:1; padding:0.5rem; border-radius:6px; border:1px solid var(--border); background:#18182b; color:var(--text);" />
+        <button id="uploadBtn">Upload to Onshape</button>
+      </div>
+      <div id="uploadStatus" class="status"></div>
+    </section>
+  </main>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
