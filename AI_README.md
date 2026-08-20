@@ -130,7 +130,7 @@ The `.ork` file is a **ZIP archive** containing `rocket.ork` (the XML design) pl
 
 8. **`<thickness>filled</thickness>`** means a solid body (not a shell). The parser sets `filled: true` and `thickness: -1` as a sentinel.
 
-9. **`auto` radius values** appear as `auto` or `auto 0.025` — the parser extracts the numeric part and flags `autoOuterRadius`/`baseRadiusAutomatic`.
+9. **`auto` radius values** appear as `auto` or `auto 0.025` — the parser extracts the numeric part and flags it: `autoOuterRadius` (body tubes) and `baseRadiusAutomatic`/`foreRadiusAutomatic` (nose cones & transitions, for aft/base vs fore radii).
 
 10. **Rail buttons** typically use `<preset>` (dimensions come from a preset database we don't ship). The parser falls back to explicit `<outerdiameter>` etc. if present.
 

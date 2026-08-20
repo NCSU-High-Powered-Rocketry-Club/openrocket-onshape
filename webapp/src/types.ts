@@ -73,7 +73,8 @@ export interface SymmetricParams {
   shoulderFore: Shoulder;
   shoulderAft: Shoulder;
   flipped: boolean; // nose cones only
-  baseRadiusAutomatic: boolean;
+  baseRadiusAutomatic: boolean; // aft/base radius marked "auto" in XML
+  foreRadiusAutomatic: boolean; // fore radius marked "auto" in XML (e.g. <foreradius>auto 0.025</foreradius>)
 }
 
 // ---------- Body Tube ----------

@@ -244,6 +244,7 @@ function parseSymmetricParams(el: Record<string, unknown>): SymmetricParams {
     },
     flipped: bool(el, 'isflipped'),
     baseRadiusAutomatic: isAuto(el['aftradius']),
+    foreRadiusAutomatic: isAuto(el['foreradius']),
   };
 }
 
