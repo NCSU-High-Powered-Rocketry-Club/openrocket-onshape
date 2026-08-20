@@ -65,7 +65,7 @@ import type {
 
 // ---------- XML parsing helpers ----------
 
-const xmlParser = new XMLParser({
+const xmlOptions = {
   ignoreAttributes: false,
   attributeNamePrefix: '@_',
   textNodeName: '#text',
@@ -73,7 +73,17 @@ const xmlParser = new XMLParser({
   parseTagValue: false, // keep everything as strings; we convert manually
   parseAttributeValue: false,
   allowBooleanAttributes: true,
-});
+};
+
+// Prettified parser: groups repeated sibling tags into arrays (loses their
+// interleaved order across groups). This is used for extracting field values.
+const xmlParser = new XMLParser(xmlOptions);
+
+// Ordered parser: preserves exact document order of children (including which
+// sibling arrives before/after another when two tags alternate, e.g.
+// bodytube / transition / bodytube / transition). This is used ONLY to recover
+// the true sibling order that the prettified parse collapses.
+const xmlParserOrdered = new XMLParser({ ...xmlOptions, preserveOrder: true });
 
 /** Parse a numeric value, handling "auto" prefixes like "auto 0.025". */
 function parseNum(value: unknown, fallback = 0): number {
@@ -455,7 +465,105 @@ const COMPONENT_TAGS: Record<string, ComponentType> = {
   boosterset: 'parallelstage', // legacy tag (pre-1.8)
 };
 
-function parseComponent(el: Record<string, unknown>, warnings: string[], type: ComponentType): RocketComponent {
+// ---------- Document-order recovery ----------
+//
+// fast-xml-parser's default ("prettified") output groups repeated sibling tags
+// into arrays keyed by tag name, so when two different tags alternate
+// (e.g. bodytube / transition / bodytube / transition) the true interleaved
+// order is lost. We build an `OrderLevel` tree from a `preserveOrder` parse and
+// use it in parseChildren() to emit siblings in real XML document order.
+
+/** The ordered (interleaved) sibling sequence of a `<subcomponents>` container. */
+interface OrderLevel {
+  /** Tags of the container's children, in exact XML document order. */
+  order: string[];
+  /** One OrderLevel per child (same index), describing that child's own children. */
+  children: OrderLevel[];
+}
+
+const EMPTY_ORDER: OrderLevel = { order: [], children: [] };
+
+/**
+ * Build an OrderLevel from the ordered (preserveOrder-parse) content array of a
+ * `<subcomponents>` container.
+ *
+ * Each entry is an element object shaped `{ tagName: childContentArray, (":@": attrs) }`
+ * (a self-closing element stores a plain string instead of an array). We skip
+ * non-element entries and recurse only into an element's own `<subcomponents>`.
+ */
+function buildOrderLevel(orderedChildren: unknown[] | Record<string, unknown>): OrderLevel {
+  if (!Array.isArray(orderedChildren)) {
+    return EMPTY_ORDER;
+  }
+  const order: string[] = [];
+  const children: OrderLevel[] = [];
+
+  for (const item of orderedChildren) {
+    if (typeof item !== 'object' || item === null) continue;
+    const entry = item as Record<string, unknown>;
+    // The element's tag is the one key that isn't a reserved/metadata key.
+    const tag = Object.keys(entry).find(
+      (k) => k !== ':@' && k !== '#text' && !k.startsWith('#')
+    );
+    if (!tag) continue;
+
+    order.push(tag);
+    let level: OrderLevel = EMPTY_ORDER;
+
+    const content = entry[tag];
+    if (Array.isArray(content)) {
+      // Find this element's nested `<subcomponents>` container, if any.
+      for (const child of content) {
+        if (typeof child !== 'object' || child === null) continue;
+        const ce = child as Record<string, unknown>;
+        if (ce['subcomponents'] !== undefined) {
+          const sub = ce['subcomponents'];
+          level = buildOrderLevel(sub as Record<string, unknown>[]);
+          break;
+        }
+      }
+    }
+    children.push(level);
+  }
+
+  return { order, children };
+}
+
+/**
+ * Resolve the OrderLevel of the rocket element's `<subcomponents>` container
+ * from the ordered (preserveOrder-parse) output tree.
+ */
+function rocketOrderLevel(
+  orderedRoot: Record<string, unknown> | Array<Record<string, unknown>>
+): OrderLevel {
+  const root = Array.isArray(orderedRoot) ? orderedRoot : [orderedRoot];
+  const openrocket = root.find((x) => x && typeof x === 'object' && 'openrocket' in x);
+  const oeChildren = openrocket
+    ? Array.isArray(openrocket.openrocket)
+      ? openrocket.openrocket
+      : [openrocket.openrocket]
+    : [];
+  const rocket = oeChildren.find(
+    (x) => x && typeof x === 'object' && 'rocket' in x
+  ) as (Record<string, unknown> & { rocket: unknown }) | undefined;
+  const rocketChildren = rocket
+    ? Array.isArray(rocket.rocket)
+      ? rocket.rocket
+      : [rocket.rocket]
+    : [];
+  const sub = rocketChildren.find(
+    (x) => x && typeof x === 'object' && 'subcomponents' in x
+  );
+  if (!sub || sub['subcomponents'] === undefined) return EMPTY_ORDER;
+  return buildOrderLevel(sub['subcomponents'] as Record<string, unknown>[]);
+}
+
+function parseComponent(
+  el: Record<string, unknown>,
+  warnings: string[],
+  type: ComponentType,
+  order: OrderLevel = EMPTY_ORDER
+): RocketComponent {
   const material = parseMaterial(el['material'] as Record<string, unknown> | undefined);
 
   let params: RocketComponent['params'];
@@ -509,31 +617,44 @@ function parseComponent(el: Record<string, unknown>, warnings: string[], type: C
     material,
     position: parsePosition(el),
     params,
-    children: parseChildren(el, warnings),
+    children: parseChildren(el, warnings, order),
   };
 }
 
-function parseChildren(el: Record<string, unknown>, warnings: string[]): RocketComponent[] {
+function parseChildren(
+  el: Record<string, unknown>,
+  warnings: string[],
+  order: OrderLevel = EMPTY_ORDER
+): RocketComponent[] {
   const sub = el['subcomponents'];
   if (sub === undefined || typeof sub !== 'object') return [];
 
-  // The children elements are keyed by their tag name
-  // (e.g. { bodytube: {...}, nosecone: {...}, stage: {...} })
+  // Sibling order comes from the `preserveOrder` parse (true document order);
+  // field values come from the prettified parse (`sub` is grouped by tag).
+  // Because both trees come from the same document, the nth occurrence of a tag
+  // in the ordered list is exactly the nth element under that tag in `sub`.
+  const grouped = sub as Record<string, unknown>;
   const components: RocketComponent[] = [];
+  const consumed: Record<string, number> = {};
 
-  for (const [tag, value] of Object.entries(sub as Record<string, unknown>)) {
+  for (let i = 0; i < order.order.length; i++) {
+    const tag = order.order[i];
     if (tag === '@_type') continue;
     const type = COMPONENT_TAGS[tag] ?? (tag === 'stage' ? 'stage' : null);
     if (!type) {
       warnings.push(`Unknown component tag: <${tag}> — skipped`);
       continue;
     }
-    for (const c of toArray<Record<string, unknown>>(
+    const occurrence = consumed[tag] ?? 0;
+    consumed[tag] = occurrence + 1;
+
+    const value = grouped[tag];
+    if (value === undefined) continue;
+    const c = toArray<Record<string, unknown>>(
       value as Record<string, unknown> | Record<string, unknown>[]
-    )) {
-      if (typeof c === 'object') {
-        components.push(parseComponent(c, warnings, type));
-      }
+    )[occurrence];
+    if (typeof c === 'object') {
+      components.push(parseComponent(c, warnings, type, order.children[i]));
     }
   }
   return components;
@@ -555,12 +676,23 @@ export async function parseOrkFile(buffer: ArrayBuffer): Promise<RocketJson> {
   }
   const xmlText = await rocketFile.async('string');
 
+  console.log(xmlText);
+
   // 2. Parse the XML
   const parsed = xmlParser.parse(xmlText);
   const root = parsed['openrocket'] as Record<string, unknown> | undefined;
   if (!root) {
     throw new Error('Invalid .ork file: missing <openrocket> root element');
   }
+
+  // Also parse with preserveOrder so we can recover exact sibling document order
+  // (the prettified parse above collapses interleaved tag groups). The ordered
+  // root is used only to resolve ordering, never for field values.
+  const orderedParsed = xmlParserOrdered.parse(xmlText) as
+    | Record<string, unknown>
+    | Array<Record<string, unknown>>;
+  const rocketOrder = rocketOrderLevel(orderedParsed);
+
   const version = textValue(root['@_version']) || 'unknown';
   const rocketEl = root['rocket'] as Record<string, unknown> | undefined;
   if (!rocketEl) {
@@ -571,7 +703,7 @@ export async function parseOrkFile(buffer: ArrayBuffer): Promise<RocketJson> {
   warnings.push(`OpenRocket file format version: ${version}`);
 
   // 3. Build the RocketJson
-  const components = parseChildren(rocketEl, warnings);
+  const components = parseChildren(rocketEl, warnings, rocketOrder);
 
   const rocket: Rocket = {
     name: str(rocketEl, 'name') || 'Unnamed Rocket',

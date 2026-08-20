@@ -138,6 +138,8 @@ The `.ork` file is a **ZIP archive** containing `rocket.ork` (the XML design) pl
 
 12. **fast-xml-parser config** is critical: `ignoreAttributes: false`, `attributeNamePrefix: '@_'`, `textNodeName: '#text'`, `parseTagValue: false`, `parseAttributeValue: false`. This keeps all values as strings so we control conversion.
 
+13. **Sibling ORDER is lost by the default parse — recover it with a second `preserveOrder` parse.** The default ("prettified") output groups repeated sibling tags into arrays keyed by tag name, so when two tag types alternate (e.g. `nosecone, bodytube, transition, bodytube, transition`) the true interleaved order collides: both the second bodytube **and** the first transition share a group, and both transitions end up at the very end. Because position methods like `bottom` are **relative to the previous sibling**, this reorders the whole rocket. Fix: run a second `XMLParser` with `preserveOrder: true`, walk it with `rocketOrderLevel()`/`buildOrderLevel()` to get each `<subcomponents>` container's exact tag sequence, then have `parseChildren()` consume the prettified grouped fields **in that document order**. Field values still come from the prettified parse; the ordered parse only supplies ordering. See `src/parser.ts` (`OrderLevel`, `buildOrderLevel`, `rocketOrderLevel`).
+
 ---
 
 ## The JSON Schema (types.ts)
