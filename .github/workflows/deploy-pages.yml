@@ -21,31 +21,42 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # pnpm, not npm: pnpm-lock.yaml is the lockfile that actually matches
+      # package.json (vite 6, vitest 4.1.11) and is what local development uses.
+      # A stale package-lock.json was tracked alongside it, so `npm ci` could not
+      # install at all. See local/independent-audit-2026-09-29.md, "Release
+      # readiness". The pinned version must match `packageManager` in
+      # webapp/package.json.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+
       - name: Setup Node
         uses: actions/setup-node@v5
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: webapp/package-lock.json
+          cache: pnpm
+          cache-dependency-path: webapp/pnpm-lock.yaml
 
       - name: Install dependencies
         working-directory: webapp
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Run tests
         working-directory: webapp
-        run: npm test
+        run: pnpm test
 
       - name: Build
         working-directory: webapp
-        run: npm run build
+        run: pnpm run build
 
       # The FeatureScript has no compiler of its own, so this is the only thing
       # that catches a release build that would not paste into Feature Studio.
       - name: Check the FeatureScript release build
         run: |
-          npm run fs:test
-          npm run fs:check
+          pnpm run fs:test
+          pnpm run fs:check
 
       - name: Setup Pages
         uses: actions/configure-pages@v6

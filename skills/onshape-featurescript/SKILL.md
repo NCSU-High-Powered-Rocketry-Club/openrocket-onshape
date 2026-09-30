@@ -606,6 +606,6 @@ worth forming from the first `println`:
 
 `tools/build-fs.mjs` in this repository implements exactly that for
 `osFeature/*.fs`; `local/featurescript-build.md` is the full rule set and
-`npm run fs:check` is the gate.
+`pnpm run fs:check` is the gate.
 
 

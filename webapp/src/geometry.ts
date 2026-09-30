@@ -143,17 +143,39 @@ export function transitionRadius(
     }
 
     case 'parabolic': {
-      // Parabolic series: y = r * (2(x/L) - (x/L)²) * p + r * (x/L)²
+      // Parabolic series. Ported from OpenRocket's
+      //   Transition.Shape.Parabolic.getRadius:
+      //     radius * ((2·x/length − param·(x/length)²) / (2 − param))
+      // This is a single rational curve, NOT a blend of two parabolas — the two
+      // forms agree only at t=1 (both reach the full radius) and at param=1
+      // (both reduce to r·(2t − t²)).  In particular OpenRocket documents
+      // param=0 as "a conical nose cone", which this expression reproduces
+      // exactly (r·2t/2 = r·t); a blended form instead returns a blunt
+      // paraboloid r·t² at param=0.
       const t = x / L;
-      z = r * (2 * t - t * t) * p + r * t * t * (1 - p);
+      // param is capped at 1 by OpenRocket's UI, but a hand-edited file could
+      // carry 2 and divide the curve by zero.  Degrade to the param=1 form,
+      // which is the only other value the editor can produce.
+      z = r * ((2 * t - p * t * t) / (p === 2 ? 1 : 2 - p));
       break;
     }
 
     case 'haack': {
-      // Von Kármán / LV-Haack series
+      // Von Kármán / LV-Haack series. Ported from OpenRocket's
+      //   Transition.Shape.Haack.getRadius:
+      //     radius * safeSqrt((θ − sin(2θ)/2 + param·sin³(θ)) / π)
+      // The param·sin³(θ) term is the whole difference between a plain Von
+      // Kármán (param=0) and an LV-Haack (param=1/3), so it must be present.
       const t = x / L;
       const theta = Math.acos(1 - 2 * t);
-      z = (r / Math.sqrt(Math.PI)) * Math.sqrt(theta - Math.sin(2 * theta) / 2);
+      const sinTheta = Math.sin(theta);
+      const radicand =
+        (theta - Math.sin(2 * theta) / 2 + p * sinTheta * sinTheta * sinTheta) /
+        Math.PI;
+      // OpenRocket's MathUtil.safeSqrt returns 0 for a negative radicand (with a
+      // warning) rather than NaN; roundoff can push it just below zero at the
+      // tip, where the true profile is already 0 anyway.
+      z = r * (radicand < 0 ? 0 : Math.sqrt(radicand));
       break;
     }
   }
@@ -783,9 +805,16 @@ export function ellipticalFinPoints(
 /**
  * Compute the touching radius for tube fins around a body of given radius.
  * r_tube = r_body * sin(π/n) / (1 - sin(π/n))
+ *
+ * The `n < 3` guard matches OpenRocket's `TubeFinSet.getOuterRadius`, which
+ * returns the plain body radius rather than the touching radius when
+ * `fins < 3`.  It is not merely cosmetic: at n=2, sin(π/2)=1 makes the
+ * denominator exactly zero, so the unguarded expression is +Infinity.  Infinity
+ * is not representable in JSON, so it would silently serialise as `null` and
+ * leave the tube fin with no radius at all.
  */
 export function tubeFinTouchingRadius(bodyRadius: number, finCount: number): number {
-  if (finCount <= 1) return bodyRadius;
+  if (finCount < 3) return bodyRadius;
   const sinAngle = Math.sin(Math.PI / finCount);
   return (bodyRadius * sinAngle) / (1 - sinAngle);
 }
@@ -1257,6 +1286,21 @@ function componentLength(comp: RocketComponent): number {
 }
 
 /**
+ * OpenRocket's `MassObject` subclasses, whose mass is a *declared* parameter
+ * rather than something derivable from a volume and a density.
+ */
+const RECOVERY_DEVICE_TYPES: ReadonlySet<ComponentType> = new Set<ComponentType>([
+  'parachute',
+  'streamer',
+  'shockcord',
+  'masscomponent',
+]);
+
+function isRecoveryDevice(comp: RocketComponent): boolean {
+  return RECOVERY_DEVICE_TYPES.has(comp.type);
+}
+
+/**
  * Estimate the mass of a component (external components only).
  * Uses volume × material density via the analytic formulas from OpenRocket.
  */
@@ -1340,8 +1384,14 @@ export function estimateComponentMass(comp: RocketComponent): number | null {
     }
 
     case 'launchlug': {
-      const { outerRadius, innerRadius, length } = p;
-      return d * Math.PI * (outerRadius * outerRadius - innerRadius * innerRadius) * length;
+      // The lug is a TUBE, so it is an annulus about its own axis. Its bore is
+      // derived (`LaunchLug.getInnerRadius()` = radius - thickness) and the
+      // parser already does that, but repeat the fallback here so this function
+      // stays correct for a hand-built component that never went through the
+      // parser -- the same guard the ring components below use.
+      const { outerRadius, innerRadius, thickness, length } = p;
+      const bore = innerRadius > 0 ? innerRadius : Math.max(0, outerRadius - thickness);
+      return d * Math.PI * (outerRadius * outerRadius - bore * bore) * length;
     }
 
     case 'innertube':
@@ -1391,34 +1441,94 @@ const AUTO_OUTER_RADIUS_RING_TYPES: ReadonlySet<ComponentType> = new Set<Compone
   'engineblock',
 ]);
 
-/** Outer radius at the fore (front) of an axial component, in meters. */
-function foreRadiusOf(comp: RocketComponent): number {
-  const p = comp.params as any;
-  if (comp.type === 'bodytube') return p.outerRadius ?? 0;
-  return p.foreRadius ?? 0;
+/**
+ * Sentinel meaning "no usable radius at this end", mirroring the `-1` Java
+ * returns from `Transition.getFrontAutoRadius()`/`getRearAutoRadius()` and from
+ * `BodyTube`'s versions when they cannot recurse. Java's callers test `r < 0`
+ * and fall through to the next component; ours test `> 0` and do the same.
+ */
+const NO_AUTO_RADIUS = -1;
+
+/** Index of the nearest preceding axial sibling, or -1. Document order. */
+function prevAxialIndex(comps: RocketComponent[], index: number): number {
+  for (let j = index - 1; j >= 0; j--) {
+    if (isAxial(comps[j])) return j;
+  }
+  return -1;
 }
 
-/** Outer radius at the aft (rear) of an axial component, in meters. */
-function aftRadiusOf(comp: RocketComponent): number {
-  const p = comp.params as any;
-  if (comp.type === 'bodytube') return p.outerRadius ?? 0;
+/** Index of the nearest following axial sibling, or -1. Document order. */
+function nextAxialIndex(comps: RocketComponent[], index: number): number {
+  for (let j = index + 1; j < comps.length; j++) {
+    if (isAxial(comps[j])) return j;
+  }
+  return -1;
+}
+
+/**
+ * Java `SymmetricComponent.getFrontAutoRadius()`: the radius this component
+ * offers to whatever sits IN FRONT of it, or NO_AUTO_RADIUS if it has none.
+ *
+ * This is a faithful port, recursion included, because that recursion is the
+ * whole substance of finding #6:
+ *
+ *  - A `Transition` (and so a nose cone / tail cone) returns NO_AUTO_RADIUS
+ *    while its AFT radius is automatic. Its stored value is then only the junk
+ *    placeholder from `auto <last-known>`, never a radius to hand out. This is
+ *    the line that makes a body tube behind an auto-base nose cone skip it and
+ *    look further back down the chain.
+ *  - A `BodyTube` with an automatic outer radius RECURSES to the component in
+ *    front of it, so a run of consecutive auto tubes all inherit the first
+ *    concrete value found.
+ *
+ * `depth` bounds the recursion at the chain length; it is only a guard against
+ * a pathological cycle, since each step strictly decreases the index.
+ */
+function frontAutoRadiusOf(comps: RocketComponent[], index: number, depth = 0): number {
+  if (index < 0 || depth > comps.length) return NO_AUTO_RADIUS;
+  const c = comps[index];
+  const p = c.params as any;
+
+  if (c.type === 'bodytube') {
+    if (p.autoOuterRadius) {
+      return frontAutoRadiusOf(comps, prevAxialIndex(comps, index), depth + 1);
+    }
+    return p.outerRadius ?? 0;
+  }
+
+  // Transition / nose cone. The parser has already swapped the ends of a
+  // flipped nose cone, so `aftRadius` is the 0-radius tip there and the base
+  // (the auto end) lives in `foreRadius` -- so a tail cone never reports an
+  // automatic aft.
+  if (p.baseRadiusAutomatic && p.flipped !== true) return NO_AUTO_RADIUS;
   return p.aftRadius ?? 0;
 }
 
-/** Nearest preceding axial sibling in the same `<subcomponents>` (document order). */
-function prevAxialSibling(comps: RocketComponent[], index: number): RocketComponent | null {
-  for (let j = index - 1; j >= 0; j--) {
-    if (isAxial(comps[j])) return comps[j];
-  }
-  return null;
-}
+/**
+ * Java `SymmetricComponent.getRearAutoRadius()`: the radius this component
+ * offers to whatever sits BEHIND it, or NO_AUTO_RADIUS if it has none.
+ *
+ * The mirror of {@link frontAutoRadiusOf}, and the recursion matters just as
+ * much: a body tube whose outer radius is automatic searches FORWARD for a
+ * concrete tube. That is how the middle tubes of `Dual parachute deployment.ork`
+ * reach 0.028321 instead of keeping their `auto 0.025` placeholder.
+ */
+function rearAutoRadiusOf(comps: RocketComponent[], index: number, depth = 0): number {
+  if (index < 0 || depth > comps.length) return NO_AUTO_RADIUS;
+  const c = comps[index];
+  const p = c.params as any;
 
-/** Nearest following axial sibling in the same `<subcomponents>` (document order). */
-function nextAxialSibling(comps: RocketComponent[], index: number): RocketComponent | null {
-  for (let j = index + 1; j < comps.length; j++) {
-    if (isAxial(comps[j])) return comps[j];
+  if (c.type === 'bodytube') {
+    if (p.autoOuterRadius) {
+      return rearAutoRadiusOf(comps, nextAxialIndex(comps, index), depth + 1);
+    }
+    return p.outerRadius ?? 0;
   }
-  return null;
+
+  // A transition offers its FORE radius backwards, and only once that fore
+  // radius is concrete.
+  if (p.foreRadiusAutomatic) return NO_AUTO_RADIUS;
+  return p.foreRadius ?? 0;
 }
 
 /**
@@ -1447,7 +1557,15 @@ function resolveAutoRadius(
   // Recurse into each component's children first (each has its own sibling chain).
   for (const child of comps) resolveAutoRadius(child.children, warnings, child);
 
-  // Fore / outer radii depend on the PREVIOUS sibling, so resolve left → right.
+  // Fore / outer radii are looked up through `frontAutoRadiusOf` /
+  // `rearAutoRadiusOf`, which recurse past any neighbour that is itself still
+  // automatic instead of trusting its stored placeholder. That is Java's
+  // behaviour, and it is what finding #6 was about: reading a raw stored value
+  // let an auto tube inherit a neighbour's junk.
+  //
+  // The two passes only decide WHICH end is written, not what it resolves to,
+  // so they run in dependency order purely to make the in-place `params`
+  // mutation settle: fore/outer left → right, then aft right → left.
   for (let i = 0; i < comps.length; i++) {
     const c = comps[i];
     if (!isAxial(c)) continue;
@@ -1459,9 +1577,10 @@ function resolveAutoRadius(
     // a transition's fore radius does. A non-flipped nose cone never reaches
     // this branch: its fore radius is always the 0-radius tip.
     if ((c.type === 'transition' || p.flipped === true) && p.foreRadiusAutomatic) {
-      const prev = prevAxialSibling(comps, i);
-      const resolved = prev ? aftRadiusOf(prev) : NaN;
-      if (prev && resolved > 0) {
+      // Java `Transition.getAutoForeRadius()`: the component in front, asked
+      // what it offers forwards.
+      const resolved = frontAutoRadiusOf(comps, prevAxialIndex(comps, i));
+      if (resolved > 0) {
         p.foreRadius = resolved;
       } else {
         warnings.push(
@@ -1471,13 +1590,13 @@ function resolveAutoRadius(
     }
 
     if (c.type === 'bodytube' && p.autoOuterRadius) {
-      const prev = prevAxialSibling(comps, i);
-      const next = nextAxialSibling(comps, i);
-      const fromPrev = prev ? aftRadiusOf(prev) : NaN;
-      const fromNext = next ? foreRadiusOf(next) : NaN;
-      if (prev && fromPrev > 0) {
+      // Java `BodyTube.getAutoOuterRadius()`: try the component in front, and
+      // only if that yields nothing usable, the one behind.
+      const fromPrev = frontAutoRadiusOf(comps, prevAxialIndex(comps, i));
+      const fromNext = rearAutoRadiusOf(comps, nextAxialIndex(comps, i));
+      if (fromPrev > 0) {
         p.outerRadius = fromPrev;
-      } else if (next && fromNext > 0) {
+      } else if (fromNext > 0) {
         p.outerRadius = fromNext;
       } else {
         warnings.push(
@@ -1569,9 +1688,11 @@ function resolveAutoRadius(
     if (!isAxial(c)) continue;
     const p = c.params as any;
     if ((c.type === 'nosecone' || c.type === 'transition') && p.baseRadiusAutomatic) {
-      const next = nextAxialSibling(comps, i);
-      const resolved = next ? foreRadiusOf(next) : NaN;
-      if (next && resolved > 0) {
+      // Java `Transition.getAutoAftRadius()`: the component behind, asked what
+      // it offers backwards. A flipped nose cone is excluded because the parser
+      // has already moved its base into `foreRadius` and it was resolved above.
+      const resolved = rearAutoRadiusOf(comps, nextAxialIndex(comps, i));
+      if (resolved > 0) {
         p.aftRadius = resolved;
       } else {
         warnings.push(
@@ -1700,24 +1821,30 @@ export function computeDerivedData(rocketJson: RocketJson): void {
       }
     }
 
-    // Add mass estimate.
+    // Resolve mass.
+    //
+    // A `<overridemass>` is a deliberate user value (typically modelling ballast)
+    // and outranks our geometric estimate, exactly as OpenRocket's
+    // `RocketComponent.getMass()` returns `overrideMass` when `massOverridden`.
+    // Discarding it in favour of a density×volume estimate would silently tell
+    // the user something different from the number they typed.
     //
     // NOTE: the FeatureScript never reads `comp.mass` -- Onshape derives mass
     // from the geometry it builds and the material assigned to it. This figure
     // exists for the web app's own summary, so it is a *design estimate*, not a
     // prediction of what Onshape will report. Do not "fix" a mismatch by
     // writing mass into the payload; there is nowhere for it to go.
-    const mass = estimateComponentMass(comp);
+    const estimate = estimateComponentMass(comp);
+    let mass: number | null = estimate;
+    if (comp.overrideMass !== undefined) {
+      mass = comp.overrideMass;
+    } else if (estimate === null && isRecoveryDevice(comp)) {
+      // A mass object's mass IS its parameter, not something to estimate.
+      const declared = (comp.params as any).mass;
+      if (typeof declared === 'number') mass = declared;
+    }
     if (mass !== null) {
       comp.mass = mass;
-    } else if (
-      (comp.type === 'parachute' ||
-        comp.type === 'streamer' ||
-        comp.type === 'shockcord' ||
-        comp.type === 'masscomponent') &&
-      typeof (comp.params as any).mass === 'number'
-    ) {
-      comp.mass = (comp.params as any).mass;
     }
 
     // Guard an exactly-zero `length`, which makes degenerate geometry downstream

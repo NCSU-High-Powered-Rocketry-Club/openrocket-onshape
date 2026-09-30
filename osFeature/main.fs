@@ -2,8 +2,10 @@ FeatureScript 3044;
 import(path : "onshape/std/common.fs", version : "3044.0");
 import(path : "onshape/std/importDerived.fs", version : "3044.0");
 import(path : "onshape/std/context.fs", version : "3044.0");
-import(path : "a0cb7665805e94f8552f9706", version : "7127c90df5986a7d2c0fbe7f");
-import(path : "cd77025bdba011dd69d477e3", version : "6b4ef6a3ed29f1cfb9cb3c87");
+import(path : "", version : ""); // @import componentSketches
+import(path : "", version : ""); // @import utils
+icon::import(path : "", version : ""); // @import icon
+image::import(path : "", version : ""); // @import image
 
 /**
  * Copyright 2026 William Degele
@@ -35,9 +37,19 @@ const DEBUG_ASSEMBLY = true;
 // Payload schema this feature understands; kept in step with parser.ts (note 18).
 const EXPECTED_SCHEMA_VERSION = "1.2";
 
+// Where the .ork -> JSON converter lives: the static web app in this repository,
+// deployed by .github/workflows/deploy-pages.yml.  Shown in the feature dialog so
+// it is one click from the JSON field it produces.
+const WEBAPP_URL = "https://ncsu-high-powered-rocketry-club.github.io/openrocket-onshape/";
+
 const FRONT_SKETCH_PLANE = transformRot(rotationMatrix3dEulerXYZ(vector(90, 0, 0) * degree));
 
-annotation { "Feature Type Name" : "OpenRocket to Onshape", "Editing Logic Function" : "oroEditingLogic", "Feature Type Description" : "Uses ORO (OpenRocket to Onshape) json from the static web app at '' to create a model of the rocket. Use the mastersketch feature to create sketches for each component of the rocket. Then derive these sketches into their own part studios and use 'Complete Component' to create geometry from that sketch. " }
+annotation {
+    "Feature Type Name" : "OpenRocket to Onshape",
+    "Editing Logic Function" : "oroEditingLogic",
+    "Feature Type Description" : "Constructs a rocket model from a JSON file exported by the OpenRocket-to-Onshape web app. Import the .json and reference it in this feature. When creating an assembly, make sure to insert **composite parts** and fasten together the provided mate connectors.",
+    "Icon" : icon::BLOB_DATA,
+    "Description Image" : image::BLOB_DATA }
 export const oroFeature = defineFeature(function(context is Context, id is Id, definition is map)
     precondition
     {
@@ -70,6 +82,15 @@ export const oroFeature = defineFeature(function(context is Context, id is Id, d
                         "Description" : "Overrides the motor length from the .ork file. Leave at 0 to use the length of the motor the file selects." }
             isLength(definition.motorLength, NONNEGATIVE_ZERO_DEFAULT_LENGTH_BOUNDS);
         }
+
+        // The converter the JSON comes from, last in the dialog: shown read-only
+        // so it is one click to find, and cannot be edited into a link that does
+        // not exist.
+        annotation { "Name" : "Web app",
+                    "Description" : "Open the converter in a new tab to turn an .ork file into the JSON this feature reads.",
+                    "Default" : WEBAPP_URL,
+                    "UIHint" : [UIHint.READ_ONLY] }
+        definition.webAppUrl is string;
     }
     {
         const jsonFile = definition.orkJsonFile;
@@ -703,10 +724,11 @@ function completeComponent(context is Context, comp is map, sketchFace, tform is
         var transforms = makeArray(instanceCount - 1);
         var instanceNames = makeArray(instanceCount - 1);
 
-        if (compType == "railbutton")
+        if (isLineInstanceable(compType))
         {
             const instanceSeparation = comp.position.instanceSeparation;
-            // linear instances
+            // linear instances: stack along the body's own axis, stepping aft by
+            // the separation for each additional copy (note 19).
             for (var i = 1; i < instanceCount; i += 1)
             {
                 transforms[i - 1] = transform(vector(0, 0, -instanceSeparation * i) * units);
@@ -1496,6 +1518,15 @@ function shoulderSummary(params) returns string
 function isAssembly(compType is string) returns boolean
 {
     return compType == "podset" || compType == "parallelstage";
+}
+
+// OpenRocket's LineInstanceable types: instances stack along the axis, not round it (note 33).
+function isLineInstanceable(compType is string) returns boolean
+{
+    return compType == "launchlug"
+        || compType == "railbutton"
+        || compType == "centeringring"
+        || compType == "bulkhead";
 }
 
 function resolveTransform(transformData is map, units is ValueWithUnits, tform is Transform, baseTransform is Transform, length is ValueWithUnits, parentLength) returns array
@@ -2420,4 +2451,27 @@ function resolveMaterial(componentMaterial)
  *     the prose, and the two agree on every real design because all 61 stored
  *     values are 0.0.  Upstream's reading is the one taken, because it is the
  *     one OpenRocket itself renders with.
+ *
+ * 33. Which components instance along the axis rather than round it
+ *
+ *     `LineInstanceable` types repeat themselves along the body's own axis,
+ *     stepping aft by `<instanceseparation>`, instead of being patterned around
+ *     it.  The set is fixed by the Java class hierarchy:
+ *
+ *     - `LaunchLug`           implements LineInstanceable
+ *     - `RailButton`          implements LineInstanceable
+ *     - `RadiusRingComponent` implements LineInstanceable
+ *       - `Bulkhead`             extends RadiusRingComponent
+ *       - `CenteringRing`        extends RadiusRingComponent
+ *
+ *     `InnerTube`, `TubeCoupler` and `EngineBlock` are NOT in this set.  They
+ *     extend `ThicknessRingComponent`, which is a SIBLING of
+ *     `RadiusRingComponent` under `RingComponent` and does not implement
+ *     `LineInstanceable`.  Treating them as line-instanceable would stack a
+ *     multi-tube motor mount into one long tube down the middle of the rocket.
+ *
+ *     The whole rule lives in `isLineInstanceable` so it cannot drift out of
+ *     step with the upstream type list, and so that a type added here later has
+ *     to be argued for against the hierarchy rather than matched by name
+ *     inline at the call site.
  */

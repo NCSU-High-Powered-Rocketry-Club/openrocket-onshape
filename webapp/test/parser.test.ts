@@ -595,9 +595,10 @@ describe('parseOrkFile', () => {
     expect(p.motorMount.configurationCount).toBe(1);
   });
 
-  it('warns when a motor mount holds several motor configurations', async () => {
-    // Only motor[0] is extracted, and it now decides the motor solid that gets
-    // built, so the choice has to be visible rather than silent.
+  it('does not warn about a mount that merely holds several motors', async () => {
+    // Which configuration is used is now an explicit choice made in the open by
+    // the webapp's dropdown, and recorded in the JSON. Warning about it on every
+    // multi-motor rocket only trained the eye to skip the warning list.
     const motor = (id: string, designation: string, length: string) =>
       `<motor configid="${id}"><type>single</type><designation>${designation}</designation>
          <diameter>0.018</diameter><length>${length}</length><delay>0.0</delay></motor>`;
@@ -612,16 +613,14 @@ describe('parseOrkFile', () => {
       </bodytube>`));
 
     const p = findByName(result.rocket.components, 'Motor Tube')!.params as any;
-    // The first configuration wins, and the count is what makes that a fact
-    // rather than an assumption.
     expect(p.motorMount.designation).toBe('C6');
     expect(p.motorMount.length).toBeCloseTo(0.07, 6);
     expect(p.motorMount.configurationCount).toBe(2);
 
     validateRocketJson(result);
-    const warning = result.warnings.find((w) => w.includes('Motor Tube') && w.includes('motor configurations'));
-    expect(warning).toBeDefined();
-    expect(warning).toContain('C6');
+    expect(
+      result.warnings.some((w) => w.includes('Motor Tube') && w.includes('motor configurations'))
+    ).toBe(false);
   });
 
   it('selects the motor belonging to the DEFAULT motor configuration', async () => {
@@ -697,6 +696,131 @@ describe('parseOrkFile', () => {
     // The digest is what OpenRocket resolves the motor's MASS from, so it has to
     // survive parsing even though the mass itself is not in the file.
     expect(dem.digest).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it('lists every motor configuration, flagging the file default', async () => {
+    // `demon 54.ork` declares five, and the default is the second one -- the
+    // ordering the webapp's dropdown renders in document order.
+    const configs = demon.rocket.motorConfigurations!;
+    expect(configs).toHaveLength(5);
+    expect(configs.map((c) => c.isDefault)).toEqual([false, true, false, false, false]);
+    // No <name> is written unless the designer overrode it, so most are ''.
+    expect(configs.every((c) => c.name === '')).toBe(true);
+    expect(configs[0].stages).toEqual([{ number: 0, active: true }]);
+    // The default is what the mounts resolved against when nothing was asked for.
+    expect(demon.rocket.motorConfigurationSource).toBe(configs[1].configId);
+  });
+
+  it('keeps a configuration name and multi-stage activeness for the booster', async () => {
+    // TestBooster's only configuration has two stages, which is the shape the
+    // dropdown label has to survive.
+    const booster = await parseOrkFile(loadOrk('TestBooster.ork'));
+    const config = booster.rocket.motorConfigurations![0];
+    expect(config.isDefault).toBe(true);
+    expect(config.stages).toEqual([
+      { number: 0, active: true },
+      { number: 1, active: true },
+    ]);
+  });
+
+  it('resolves every mount against a user-picked motor configuration', async () => {
+    // The whole point of the dropdown: build a configuration that is not the
+    // file's default. `demon 54.ork` opens with H250G and flies I200W, so
+    // asking for the opening configuration must put H250G back.
+    const first = demon.rocket.motorConfigurations![0].configId;
+    const picked = await parseOrkFile(loadOrk('demon 54.ork'), { motorConfiguration: first });
+    const mount = mountOf(picked, 'Inner Tube');
+    expect(picked.rocket.motorConfigurationSource).toBe(first);
+    expect(mount.designation).toBe('H250G');
+    expect(mount.selectedConfigId).toBe(first);
+    // The candidates are unchanged -- only the resolution moved.
+    expect(mount.configurations).toHaveLength(5);
+
+    // And the default still wins when no option is passed.
+    expect(mountOf(demon, 'Inner Tube').designation).toBe('I200W');
+  });
+
+  it('falls back to the default when the requested configuration is unknown', async () => {
+    // A stale id must not silently resolve to "no motor anywhere".
+    const picked = await parseOrkFile(loadOrk('demon 54.ork'), { motorConfiguration: 'not-a-config' });
+    expect(picked.rocket.motorConfigurationSource).toBe(demon.rocket.motorConfigurationSource);
+    expect(mountOf(picked, 'Inner Tube').designation).toBe('I200W');
+  });
+
+  it('omits the configuration list for a file that declares none', async () => {
+    const plain = await parseOrkFile(await syntheticOrk(`
+      <bodytube><name>BT</name><length>0.3</length><radius>0.025</radius><thickness>0.001</thickness>
+        <motormount>
+          <ignitionevent>automatic</ignitionevent><ignitiondelay>0.0</ignitiondelay>
+          <overhang>0.0127</overhang>
+          <motor configid="a"><designation>C6</designation><diameter>0.018</diameter><length>0.07</length></motor>
+        </motormount>
+      </bodytube>`));
+    expect(plain.rocket.motorConfigurations).toBeUndefined();
+    expect(plain.rocket.motorConfigurationSource).toBeUndefined();
+    // No configuration to match, so the first motor is taken and says so.
+    const mount = mountOf(plain, 'BT');
+    expect(mount.designation).toBe('C6');
+    expect(mount.selectedConfigId).toBe('a');
+  });
+
+  it('builds NO motor for a configuration that loads none, and says so', async () => {
+    // The one genuinely silent case, and a real bug before this change: the
+    // parser fell back to the first motor whenever the selected configuration
+    // had none for that mount. That is defensible for the file's DEFAULT
+    // configuration (which loads a motor in every mount by definition) but not
+    // for one the user picked -- it fabricated a motor the configuration never
+    // loads, contradicting the dropdown's own "no motors" label.
+    const motor = (id: string, designation: string, length: string) =>
+      `<motor configid="${id}"><type>single</type><designation>${designation}</designation>
+         <diameter>0.018</diameter><length>${length}</length><delay>0.0</delay></motor>`;
+    const preamble = `
+      <motorconfiguration configid="cfg-1"><name>Loaded</name><stage number="0" active="true"/></motorconfiguration>
+      <motorconfiguration configid="cfg-2" default="true"><name>Parked</name><stage number="0" active="true"/></motorconfiguration>`;
+    // The mount only defines a motor for cfg-1, so cfg-2 genuinely has none.
+    const body = `
+      <bodytube><name>Motor Tube</name><length>0.3</length><radius>0.012</radius><thickness>0.001</thickness>
+        <motormount>
+          <ignitionevent>automatic</ignitionevent><ignitiondelay>0.0</ignitiondelay>
+          <overhang>0.0127</overhang>
+          ${motor('cfg-1', 'C6', '0.07')}
+        </motormount>
+      </bodytube>`;
+
+    const parked = await parseOrkFile(await syntheticOrkWithRocketPreamble(preamble, body));
+    const p = parked.rocket.components[0].children[0] as any;
+    expect(p.params.motorMount.designation).toBe('');
+    expect(p.params.motorMount.selectedConfigId).toBe('');
+    expect(p.params.motorMount.diameter).toBe(0);
+    // The candidates are still there, so the emptiness is explainable.
+    expect(p.params.motorMount.configurations.map((c: any) => c.designation)).toEqual(['C6']);
+
+    validateRocketJson(parked);
+    const detail = parked.warningDetails?.find((w) => w.message.includes('loads no motor'));
+    expect(detail).toBeDefined();
+    expect(detail!.message).toContain('Motor Tube');
+    expect(detail!.message).toContain('C6');
+    // Low, not medium: it must not block the auto-download the old one did.
+    expect(detail!.severity).toBe('low');
+
+    // The configuration that DOES load a motor is unaffected and unremarkable.
+    const loaded = await parseOrkFile(await syntheticOrkWithRocketPreamble(preamble, body), {
+      motorConfiguration: 'cfg-1',
+    });
+    expect((loaded.rocket.components[0].children[0] as any).params.motorMount.designation).toBe('C6');
+    validateRocketJson(loaded);
+    expect(loaded.warningDetails?.some((w) => w.message.includes('loads no motor'))).toBe(false);
+  });
+
+  it('leaves a genuinely motorless mount alone, with no warning at all', async () => {
+    // TestBooster's first mount is a motor mount with nothing in it in ANY
+    // configuration. That is not a configuration choice, so it is not our
+    // business to warn about.
+    const booster = await parseOrkFile(loadOrk('TestBooster.ork'));
+    validateRocketJson(booster);
+    const mounts = flatten(booster.rocket.components).filter((c) => (c.params as any)?.isMotorMount);
+    expect((mounts[0].params as any).motorMount.configurationCount).toBe(0);
+    expect(booster.warnings.some((w) => w.includes('loads no motor'))).toBe(false);
   });
 
   it('parses parachute with packed dimensions', () => {

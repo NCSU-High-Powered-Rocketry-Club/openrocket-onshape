@@ -1,5 +1,11 @@
 openrocket-unstable/*
+node_modules/
 */node_modules/*
 */dist/*
 dist/
 local/
+# Per-mode build configs: these carry Onshape document ids, which are the
+# document owner's, not the repository's.  tools/build-config.example.json is
+# the tracked template.
+tools/feature-imports-*.json
+tools/build-config.json

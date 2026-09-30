@@ -1,6 +1,6 @@
 FeatureScript 3044;
 import(path : "onshape/std/common.fs", version : "3044.0");
-import(path : "cd77025bdba011dd69d477e3", version : "6b4ef6a3ed29f1cfb9cb3c87");
+import(path : "", version : ""); // @import utils
 
 /**
  * Copyright 2026 William Degele

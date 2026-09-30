@@ -1,12 +1,13 @@
 {
   "name": "openrocket-onshape",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "OpenRocket .ork to Onshape: static web app (webapp/) + FeatureScript exporter (osFeature/)",
   "type": "module",
+  "packageManager": "pnpm@11.22.0",
   "scripts": {
-    "fs:debug": "node tools/build-fs.mjs",
-    "fs:release": "node tools/build-fs.mjs --release",
+    "fs:dev": "node tools/build-fs.mjs --config tools/feature-imports-dev.json --out dist/featurescript/dev",
+    "fs:release": "node tools/build-fs.mjs --config tools/feature-imports-prod.json --out dist/featurescript/release",
     "fs:check": "node tools/build-fs.mjs --release --check",
     "fs:test": "node --test \"tools/*.test.mjs\""
   }

@@ -47,10 +47,16 @@ openrocket-onshape/
 │   ├── component_sketches.fs       # Component sketches and fin snapping
 │   └── utils.fs                    # Shared conversion/transform helpers
 ├── tools/
-│   ├── build-fs.mjs                # FeatureScript debug / release build
-│   └── build-fs.test.mjs           # Its tests (node --test)
+│   ├── build-fs.mjs                # FeatureScript dev / release build
+│   ├── build-fs.test.mjs           # Its tests (node --test)
+│   ├── build-config.example.json   # Template for a build config
+│   └── feature-imports-*.json      # Per-mode configs — UNTRACKED, hold document ids
 ├── skills/onshape-featurescript/   # FeatureScript research and authoring notes
 ```
+
+**The Onshape document ids are not in this repository.** `osFeature/*.fs` leaves
+them blank; `tools/feature-imports-dev.json` and `-prod.json` hold them and are
+gitignored. `dist/` is generated — never edit or commit it.
 
 **Comment convention in `osFeature/*.fs`.** Inline comments say *what* the code does, in one or two
 lines; every *why* — a rule, a past failure, a rejected alternative — lives in the numbered notes at
@@ -415,16 +421,104 @@ The FeatureScript entry point is `osFeature/main.fs`; component sketch builders 
 - `component_sketches.fs` — body/revolution profiles, planar fin snapping, elliptical half-ellipse profiles, and tube-fin sections.
 - `utils.fs` — point conversion, transform helpers, and Euler rotation construction.
 
-**Debug vs. release build.** `osFeature/*.fs` is written with all its `println`
-diagnostics in place, guarded by a `const DEBUG_*` flag. `tools/build-fs.mjs`
-strips them for publishing: `npm run fs:release` writes
-`dist/featurescript/release/*.fs` to paste into Feature Studio, `npm run fs:debug`
-writes a banner-marked copy that behaves identically, and `npm run fs:check`
-validates a release build without writing (it runs in CI). A `println` the user
-needs to see survives with a `// @keep` comment above it; a debug branch must be
-braced and must not test its flag with `!`, or the build refuses rather than
-guessing. Full rules, including how debug-only helpers are detected, are in
-`local/featurescript-build.md`. **Edit `osFeature/`, never `dist/`.**
+### The feature dialog
+
+Fields appear in the dialog in this order:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| ORO json | `JSONData` | the exported payload; the feature refuses to run without it |
+| Motor mass (g) | real, 0–1000 | only shown when the payload has no motor mass |
+| Motor length | length | only shown when the payload has no motor length |
+| Web app | `string` | `UIHint.READ_ONLY`, `Default` = `WEBAPP_URL` |
+
+The two `*InFile` flags sit between `ORO json` and the motor fields but are
+`ALWAYS_HIDDEN`; `oroEditingLogic` fills them from the attached payload, which is
+what decides whether the two motor fields are offered. `Web app` is declared
+last, after both conditionals, so it is always the final field in the dialog.
+
+`WEBAPP_URL` points at the deployed converter, the
+[GitHub Pages site](https://ncsu-high-powered-rocketry-club.github.io/openrocket-onshape/).
+Its host is `NCSU-High-Powered-Rocketry-Club` (the git remote) and its path is
+`/openrocket-onshape/`, which is the `base` in `webapp/vite.config.ts`; the
+workflow that publishes it is `.github/workflows/deploy-pages.yml`. The full
+address appears in exactly two tracked places: `WEBAPP_URL` here and the link
+above. It is a read-only field rather than part of the feature description so it
+cannot be edited into a dead address. **If the site ever moves, change both.**
+
+### Building it: dev and release
+
+`osFeature/*.fs` is written with all its `println` diagnostics in place, guarded
+by a `const DEBUG_*` flag. `tools/build-fs.mjs` strips them for publishing.
+**pnpm, not npm** — it is pinned in the root `packageManager` and the web app
+already uses it.
+
+| Command | Reads | Writes | Strips debug |
+| --- | --- | --- | --- |
+| `pnpm run fs:dev` | `tools/feature-imports-dev.json` | `dist/featurescript/dev/` | per that file's `mode` |
+| `pnpm run fs:release` | `tools/feature-imports-prod.json` | `dist/featurescript/release/` | per that file's `mode` |
+| `pnpm run fs:check` | — | nothing (runs in CI) | always |
+| `pnpm run fs:test` | — | nothing | — |
+
+Each script names a **config** and a **folder**; neither names a mode. The mode
+comes from the config, so a script cannot contradict its own name. A
+`--dev` / `--release` flag overrides the config — that is how `fs:check` forces a
+release build on a checkout with no config (a dev build would validate nothing).
+Running `node tools/build-fs.mjs` with no `--config` falls back to
+`local/build-config.json`, then to dev.
+
+**Paste from `dist/`, never from `osFeature/`.** The sources carry no document
+ids (below), so only the built copies are pasteable. The build refuses to write
+a dev build into the release folder, so a file with its debug statements still in
+it cannot sit where you would assume it is ready to publish.
+
+**What a release build removes:** the `DEBUG_*` flag and its `// TEMPORARY`
+note; `if (DEBUG_*)` / `else if (DEBUG_*)` branches; every `println(...)` unless
+the line above says `// @keep`; top-level helpers the strip orphaned; the
+branches those left empty; and the locals and catch bindings they left unused
+(Feature Studio reports "Variable x set but not used"). It refuses rather than
+guessing: an unbraced debug branch, a flag tested with `!`, or a hard-coded
+document id are errors. Full rules in `local/featurescript-build.md`.
+**Edit `osFeature/`, never `dist/`.**
+
+### The build config
+
+One JSON file per mode, both gitignored because they carry Onshape document ids:
+
+```json
+{
+  "mode": "release",
+  "imports": {
+    "componentSketches": { "path": "<document id>", "version": "<microversion>" },
+    "utils":            { "path": "<document id>", "version": "<microversion>" },
+    "icon":             { "path": "<document id>", "version": "<microversion>" },
+    "image":            { "path": "<document id>", "version": "<microversion>" }
+  }
+}
+```
+
+`mode` is `dev` or `release` and decides one thing only: whether the `println`
+diagnostics are stripped. Nothing else about the output differs. Any other value
+is an error, as is an unrecognised top-level key — a misspelt `imprts` would
+otherwise load as a config with no imports in it. `tools/build-config.example.json`
+is the tracked template.
+
+`imports` holds the **Onshape document ids**, which belong to the document's
+owner rather than to the repository and change with every version. An import
+naming a Feature Studio tab or an uploaded icon/image therefore leaves its ids
+blank in the source and tags the line for the build to fill:
+
+```featurescript
+import(path : "", version : ""); // @import utils
+icon::import(path : "", version : ""); // @import icon
+```
+
+`onshape/std/...` imports stay written out, since they are versioned with the
+`FeatureScript N;` header and are the same for everyone. The build fails rather
+than guessing: a hard-coded id in a source, a blank import with no tag, an
+unknown tag, or a blank config field are all errors. A dev build with no config
+still runs and says the ids are blank — fine for reading the file, not for
+pasting it.
 
 FeatureScript-specific rules:
 
@@ -498,13 +592,14 @@ Real `.ork` test files in `webapp/test/ork/`:
 - `Low-Boom SST.ork` — nosecone, transition, bodytube, podset, freeformfinset, centeringring, parachute, shockcord, innertube
 - `TestBooster.ork` — nosecone, bodytube, transition, freeformfinset (bottom-positioned on a **narrowing ellipsoid** transition), parallelstage/booster set. The regression case for both the freeform root-chord length and the curved-parent fin snap.
 
-Run tests: `cd webapp && npm test` (or `npx vitest run`)
+Run tests: `cd webapp && pnpm test` (or `pnpm exec vitest run`)
 
 The FeatureScript build has its own tests, run with Node's built-in runner and no
-dependencies: `npm run fs:test` (`node --test "tools/*.test.mjs"`). They cover the
+dependencies: `pnpm run fs:test` (`node --test "tools/*.test.mjs"`). They cover the
 stripper's awkward cases — else-chains, unbraced branches, negated flags, a
-helper only reachable from another file's debug branch — and assert that the
-real `osFeature/` sources strip cleanly.
+helper only reachable from another file's debug branch — the import filling and
+config validation, the rule that a dev build may not be written to the release
+folder, and they assert that the real `osFeature/` sources strip cleanly.
 
 **Test files:**
 - `webapp/test/parser.test.ts` — 63 tests: parses the real .ork files, verifies metadata, stages, all component types (including elliptical and tube fins), automatic tube-fin radius resolution, materials, position methods, instance counts, angle/radius offsets, fin-tab position handling, and derived data.

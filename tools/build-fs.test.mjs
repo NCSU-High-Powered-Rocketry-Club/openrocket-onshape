@@ -8,12 +8,14 @@
  */
 
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, relative, resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { removeOrphans, stripDebug, validate } from './build-fs.mjs';
+import { fillImports, insertBanner, loadConfig, removeOrphans, stripDebug, validate } from './build-fs.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const HEADER = 'FeatureScript 3044;\nimport(path : "onshape/std/common.fs", version : "3044.0");\n\n';
@@ -35,6 +37,324 @@ function release(...sources) {
 function releaseOne(source) {
     return release(source).docs[0].text;
 }
+
+// ------------------------------------------------------------ document ids
+//
+// The Onshape document ids are per-document and untracked, so the sources
+// leave them blank and the build fills them from a config.  Each of these is a
+// way that can go wrong; a wrong fill is the one outcome not allowed.
+
+const CONFIG = {
+    componentSketches: { path: 'a0cb7665', version: '7127c90d' },
+    utils: { path: 'cd77025b', version: '6b4ef6a3' },
+    icon: { path: '0b745fbc', version: '15543728' },
+    image: { path: '26547900', version: '5b03f331' },
+};
+
+const BLANK_DOC = [
+    'FeatureScript 3044;',
+    'import(path : "onshape/std/common.fs", version : "3044.0");',
+    'import(path : "", version : ""); // @import utils',
+    'icon::import(path : "", version : ""); // @import icon',
+    '',
+    'const A = 1;',
+].join('\n');
+
+test('fills a blank import from the config and keeps the tag', () => {
+    const out = fillImports(BLANK_DOC, CONFIG, 'x.fs').text;
+    assert.ok(
+        out.includes('import(path : "cd77025b", version : "6b4ef6a3"); // @import utils'),
+        'the plain import is filled');
+    assert.ok(
+        out.includes('icon::import(path : "0b745fbc", version : "15543728"); // @import icon'),
+        'the namespaced import is filled');
+    assert.ok(!out.includes('path : ""'), 'no blank import is left behind');
+});
+
+test('leaves the std imports alone', () => {
+    // They are versioned with the `FeatureScript 3044;` header, not per
+    // document, so they stay written out in the source and must survive.
+    const out = fillImports(BLANK_DOC, CONFIG, 'x.fs').text;
+    assert.ok(out.includes('import(path : "onshape/std/common.fs", version : "3044.0");'));
+});
+
+test('refuses a document id written out in the source', () => {
+    // This is the whole point: the id must not be committable.
+    const hard = BLANK_DOC.replace(
+        'import(path : "", version : ""); // @import utils',
+        // A made-up id, not a real one: this fixture is committed, and a real
+        // document id in the repository is exactly what the build exists to
+        // keep out of it.
+        'import(path : "0123456789abcdef01234567", version : "fedcba9876543210fedcba98");');
+    assert.throws(() => fillImports(hard, CONFIG, 'x.fs'), /document id is written out/);
+});
+
+test('refuses a blank import with no tag, rather than guessing', () => {
+    const untagged = BLANK_DOC.replace(' // @import utils', '');
+    assert.throws(() => fillImports(untagged, CONFIG, 'x.fs'), /no `.*@import <key>.*` tag/);
+});
+
+test('refuses a key the config does not have, and names the keys it does', () => {
+    const odd = BLANK_DOC.replace('@import icon', '@import iconBlob');
+    assert.throws(() => fillImports(odd, CONFIG, 'x.fs'), /@import iconBlob is not in/);
+    try
+    {
+        fillImports(odd, CONFIG, 'x.fs');
+    }
+    catch (error)
+    {
+        assert.ok(error.message.includes('componentSketches, icon, image, utils'),
+            'the message lists what the config does have');
+    }
+});
+
+test('reports every bad import in a document, not just the first', () => {
+    // A fix-everything-one-error-at-a-time loop is the failure mode here.
+    const bad = BLANK_DOC.replace(' // @import utils', '').replace('@import icon', '@import nope');
+    assert.throws(() => fillImports(bad, CONFIG, 'x.fs'), (error) => {
+        assert.ok(error.message.includes('line 3'), 'reports the untagged line');
+        assert.ok(error.message.includes('line 4'), 'reports the unknown key');
+        return true;
+    });
+});
+
+test('a non-strict fill leaves ids blank instead of failing', () => {
+    // What a debug build does before the config exists: the file is not
+    // pasteable yet, but the build still produces output.
+    const out = fillImports(BLANK_DOC, {}, 'x.fs', false).text;
+    assert.ok(out.includes('import(path : "", version : ""); // @import utils'));
+    assert.ok(!out.includes('cd77025b'));
+});
+
+test('loadConfig reads the mode and the imports, and refuses nonsense', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'build-fs-'));
+    const path = (name, body) => {
+        const file = join(dir, name);
+        writeFileSync(file, body);
+        return file;
+    };
+
+    assert.deepEqual(
+        loadConfig(path('ok.json', JSON.stringify({ mode: 'release', imports: CONFIG }))),
+        { mode: 'release', imports: CONFIG }, 'a complete config loads');
+    assert.deepEqual(loadConfig(join(dir, 'absent.json')), { mode: null, imports: {} },
+        'no file is an empty config, not an error');
+    assert.deepEqual(
+        loadConfig(path('modeonly.json', '{"mode":"dev"}')).mode, 'dev',
+        'the mode may be given on its own');
+    assert.deepEqual(
+        loadConfig(path('importsonly.json', JSON.stringify({ imports: CONFIG }))).mode, null,
+        'the imports may be given on their own');
+
+    assert.throws(
+        () => loadConfig(path('mode.json', '{"mode":"production"}')),
+        /"mode" must be one of dev, release, not "production"/);
+    assert.throws(
+        () => loadConfig(path('typo.json', '{"imprts":{}}')),
+        /unknown key "imprts"/);
+    assert.throws(
+        () => loadConfig(path('blank.json', '{"imports":{"utils":{"path":"","version":"v"}}}')),
+        /"imports.utils.path" must be a non-empty string/);
+    assert.throws(
+        () => loadConfig(path('half.json', '{"imports":{"utils":{"path":"p"}}}')),
+        /"imports.utils.version" must be a non-empty string/);
+    assert.throws(() => loadConfig(path('array.json', '[]')), /must be a JSON object/);
+    assert.throws(() => loadConfig(path('bad.json', '{')), /is not valid JSON/);
+});
+
+test('the config picks the mode, and a flag overrides it', () => {
+    // The point of putting `mode` in the config: one file per mode, named on the
+    // command line, and each build does the right thing without a flag.
+    const dir = mkdtempSync(join(tmpdir(), 'build-fs-'));
+    const run = (args) => spawnSync(
+        process.execPath, [join(ROOT, 'tools', 'build-fs.mjs'), ...args],
+        { encoding: 'utf8' });
+    const out = join(dir, 'out');
+    const config = (name, body) => {
+        const file = join(dir, name);
+        writeFileSync(file, body);
+        return file;
+    };
+
+    const devConfig = config('dev.json', JSON.stringify({ mode: 'dev', imports: CONFIG }));
+    const relConfig = config('rel.json', JSON.stringify({ mode: 'release', imports: CONFIG }));
+
+    const dev = run(['--config', devConfig, '--out', out]);
+    assert.equal(dev.status, 0, 'a dev config builds');
+    assert.doesNotMatch(dev.stdout, /debug constructs stripped/, 'a dev build strips nothing');
+    assert.match(dev.stdout, /^dev build/m);
+
+    const rel = run(['--config', relConfig, '--out', out]);
+    assert.equal(rel.status, 0, 'a release config builds');
+    assert.match(rel.stdout, /debug constructs stripped/, 'release mode strips');
+
+    // A flag beats the config, which is how CI gets a release build out of a
+    // checkout with no config at all.
+    const overridden = run(['--config', devConfig, '--release', '--out', out]);
+    assert.match(overridden.stdout, /debug constructs stripped/, '--release overrides "mode": "dev"');
+
+    // Neither a flag nor a config: dev, because that changes no code.
+    const bare = run(['--config', join(dir, 'absent.json'), '--out', out]);
+    assert.equal(bare.status, 0, 'no config falls back to a dev build');
+    assert.match(bare.stdout, /^dev build/m, 'and says so');
+});
+
+test('each fs: script names the config it builds from, not a bare mode', () => {
+    // The scripts must not hardcode a mode: the point of the per-mode config
+    // files is that `pnpm run fs:dev` reads the dev one and
+    // `pnpm run fs:release` reads the prod one, each bringing its own ids AND
+    // its own mode.  A stray --dev/--release would silently override that.
+    const scripts = JSON.parse(
+        readFileSync(join(ROOT, 'package.json'), 'utf8')).scripts;
+
+    // Each script also names its output folder, so a config saying
+    // "mode": "release" cannot send `fs:dev`'s output to the release folder.
+    const expected = {
+        'fs:dev': ['tools/feature-imports-dev.json', 'dist/featurescript/dev'],
+        'fs:release': ['tools/feature-imports-prod.json', 'dist/featurescript/release'],
+    };
+
+    for (const [name, [config, outDir]] of Object.entries(expected))
+    {
+        const command = scripts[name];
+        assert.ok(command !== undefined, `${name} exists`);
+        assert.ok(command.includes(`--config ${config}`),
+            `${name} builds from ${config}, got: ${command}`);
+        assert.ok(command.includes(`--out ${outDir}`),
+            `${name} must write to ${outDir}, got: ${command}`);
+        assert.doesNotMatch(command, /--dev\b|--debug\b|--release\b/,
+            `${name} must let the config choose the mode, got: ${command}`);
+    }
+
+    // fs:check has no ids to fill, so it forces the mode it validates.
+    assert.match(scripts['fs:check'], /--release/);
+});
+
+test('a dev build is refused into the release folder', () => {
+    // The worst possible failure: an unstripped file sitting where a reader
+    // assumes it is ready to paste into Feature Studio.
+    const run = (args) => spawnSync(
+        process.execPath, [join(ROOT, 'tools', 'build-fs.mjs'), ...args],
+        { encoding: 'utf8' });
+    const dir = mkdtempSync(join(tmpdir(), 'build-fs-'));
+    const out = join(dir, 'release');
+
+    // A config of its own, carrying ids: a release build needs one, and the
+    // real local/build-config.json is gitignored, so relying on it would make
+    // this test pass on a developer machine and fail in CI.
+    const config = join(dir, 'config.json');
+    writeFileSync(config, JSON.stringify({ mode: 'release', imports: CONFIG }));
+
+    const refused = run(['--dev', '--config', config, '--out', out]);
+    assert.equal(refused.status, 1, 'a dev build must not be written to a release folder');
+    assert.match(refused.stderr, /refusing to write a dev build/);
+
+    const allowed = run(['--release', '--config', config, '--out', out]);
+    assert.equal(allowed.status, 0, 'a release build there is exactly the point');
+});
+
+test('--check refuses a dev build rather than validating nothing', () => {
+    const run = (args) => spawnSync(
+        process.execPath, [join(ROOT, 'tools', 'build-fs.mjs'), ...args],
+        { encoding: 'utf8' });
+
+    const dev = run(['--check', '--dev']);
+    assert.equal(dev.status, 1);
+    assert.match(dev.stderr, /--check only makes sense for a release build/);
+});
+
+test('the tracked sources name no document id, and the release build fills them all', () => {
+    // The regression this whole mechanism exists to prevent.
+    for (const name of readdirSync(join(ROOT, 'osFeature')).filter((f) => f.endsWith('.fs')))
+    {
+        const text = readFileSync(join(ROOT, 'osFeature', name), 'utf8');
+        for (const line of text.split('\n').filter((l) => /^\s*(?:\w+::)?import\s*\(/.test(l)))
+        {
+            if (line.includes('onshape/std/'))
+            {
+                continue;
+            }
+            assert.match(line, /path\s*:\s*""/, `${name}: ${line.trim()} must be blank`);
+            assert.match(line, /@import\s+\S+/, `${name}: ${line.trim()} must be tagged`);
+        }
+    }
+});
+
+test('a release build to WRITE needs the ids, but --check does not', () => {
+    // CI runs `fs:check` on a fresh checkout, which by design has no config
+    // (the ids are untracked).  It must still pass there, while a build that
+    // writes a file Feature Studio has to import from must not.
+    const run = (args) => spawnSync(
+        process.execPath, [join(ROOT, 'tools', 'build-fs.mjs'), ...args],
+        { encoding: 'utf8' });
+
+    const missing = join(mkdtempSync(join(tmpdir(), 'build-fs-')), 'absent.json');
+    const writing = run(['--release', '--config', missing]);
+    assert.equal(writing.status, 1, 'a release build with no config refuses to write');
+    assert.match(writing.stderr, /cannot be written without it/);
+
+    const checking = run(['--release', '--check', '--config', missing]);
+    assert.equal(checking.status, 0, 'a --check run passes without the ids');
+    assert.match(checking.stdout, /Nothing written/);
+});
+
+test('no real Onshape document id is committed anywhere in the repository', () => {
+    // A document id is 24 hex characters.  It belongs to whoever made that
+    // document, it changes with every version, and it must never be committed
+    // -- this very test file once carried a real one in a fixture.
+    const skip = ['node_modules', 'dist', '.git', 'openrocket-unstable', 'local'];
+    const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory())
+        {
+            return skip.includes(entry.name) ? [] : walk(full);
+        }
+        return /\.(fs|mjs|js|ts|json|md|yml|yaml|html)$/.test(entry.name) ? [full] : [];
+    });
+
+    const ID = /\b[0-9a-f]{24}\b/;
+    const offenders = [];
+    for (const file of walk(ROOT))
+    {
+        if (file.endsWith('build-fs.test.mjs'))
+        {
+            continue; // this test, and the placeholder fixture it documents
+        }
+        for (const [i, line] of readFileSync(file, 'utf8').split('\n').entries())
+        {
+            // Only an import line can be a leaked id; 24 hex elsewhere is a hash.
+            if (/import\s*\(/.test(line) && ID.test(line))
+            {
+                offenders.push(`${relative(ROOT, file)}:${i + 1}: ${line.trim()}`);
+            }
+        }
+    }
+
+    assert.deepEqual(offenders, [],
+        'document ids must stay in the untracked build config');
+});
+
+test('the banner goes after a namespaced import, not before it', () => {
+    // main.fs imports its icon and description image as `icon::import(...)`,
+    // which the banner's import pattern has to recognise or the banner lands
+    // above them and Onshape rejects the document.
+    const source = [
+        'FeatureScript 3044;',
+        'import(path : "onshape/std/common.fs", version : "3044.0");',
+        'icon::import(path : "0b745fbc", version : "15543728");',
+        'image::import(path : "26547900", version : "5b03f331");',
+        '',
+        'annotation { "Feature Type Name" : "X" }',
+    ].join('\n');
+
+    const out = insertBanner(source, '// BANNER');
+
+    const lines = out.split('\n');
+    const bannerLine = lines.indexOf('// BANNER');
+    const lastImport = lines.reduce(
+        (last, line, i) => (line.includes('import(') ? i : last), -1);
+    assert.ok(bannerLine > lastImport, 'banner follows every import');
+});
 
 test('drops the debug flag and the branch it guards', () => {
     const out = releaseOne([

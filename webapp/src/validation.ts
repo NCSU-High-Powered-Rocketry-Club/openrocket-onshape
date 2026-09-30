@@ -119,18 +119,25 @@ function validateCounts(rocketJson: RocketJson, component: RocketComponent) {
   if (position && (!Number.isInteger(position.instanceCount) || position.instanceCount < 1)) addWarning(rocketJson, 'high', `Instance count must be a positive integer for ${component.name}.`, component);
   if (p?.finCount !== undefined && (!Number.isInteger(p.finCount) || p.finCount < 1)) addWarning(rocketJson, 'high', `Fin count must be a positive integer for ${component.name}.`, component);
 
-  // A motor mount may hold several motor configurations, and only the one
-  // matching the rocket's default configuration is extracted. That was harmless
-  // while the motor data went unused; now it is turned into a solid, so which
-  // configuration won decides the geometry, and saying so is the difference
-  // between a known simplification and a silent one.
+  // A mount that holds several motors no longer warrants a warning on its own.
+  // Which configuration is used is a choice the webapp now makes explicitly, in
+  // the open, via the motor-configuration dropdown -- and the JSON records the
+  // answer in `motorConfigurationSource` and each mount's `selectedConfigId`.
+  // Warning about it anyway only trained the eye to skip the warning list.
+  //
+  // What IS still worth saying is the one case that is genuinely silent and can
+  // surprise: the mount defines motors, but the selected configuration loads
+  // NONE of them, so no motor geometry is built here. That is legitimate -- a
+  // booster parked for this flight -- but it means the model has a motor mount
+  // with nothing in it, which looks like a bug until you know why.
   const mount = p?.motorMount;
-  if (mount && typeof mount.configurationCount === 'number' && mount.configurationCount > 1) {
-    const others = (mount.configurations ?? [])
-      .map((c: { designation: string }) => c.designation)
-      .filter((d: string) => d && d !== mount.designation);
-    const alsoOn = others.length > 0 ? ` Also defined: ${others.join(', ')}.` : '';
-    addWarning(rocketJson, 'medium', `${component.name}: ${mount.configurationCount} motor configurations are defined; the default configuration's "${mount.designation || 'unnamed motor'}" is used for the motor geometry.${alsoOn}`, component);
+  if (mount && typeof mount.configurationCount === 'number' && mount.configurationCount > 0 && !mount.designation) {
+    const selectedId = rocketJson.rocket.motorConfigurationSource ?? '';
+    const config = rocketJson.rocket.motorConfigurations?.find((c) => c.configId === selectedId);
+    const others = (mount.configurations ?? []).map((c: { designation: string }) => c.designation).filter(Boolean);
+    const alsoOn = others.length > 0 ? ` Motors defined for other configurations: ${others.join(', ')}.` : '';
+    const which = config ? `the "${config.name || 'unnamed'} configuration"` : 'the selected configuration';
+    addWarning(rocketJson, 'low', `${component.name}: ${which} loads no motor into this mount, so no motor geometry is built.${alsoOn}`, component);
   }
 }
 

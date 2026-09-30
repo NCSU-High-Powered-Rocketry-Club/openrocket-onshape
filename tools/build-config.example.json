@@ -1,0 +1,21 @@
+{
+  "mode": "dev",
+  "imports": {
+    "componentSketches": {
+      "path": "",
+      "version": ""
+    },
+    "utils": {
+      "path": "",
+      "version": ""
+    },
+    "icon": {
+      "path": "",
+      "version": ""
+    },
+    "image": {
+      "path": "",
+      "version": ""
+    }
+  }
+}

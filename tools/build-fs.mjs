@@ -8,11 +8,17 @@
  * anything the tool does not positively recognise is either kept or reported
  * as an error, never silently dropped.
  *
- *   node tools/build-fs.mjs                        debug build   -> dist/featurescript/debug
+ *   node tools/build-fs.mjs                        dev build     -> dist/featurescript/dev
  *   node tools/build-fs.mjs --release              release build -> dist/featurescript/release
  *   node tools/build-fs.mjs --release --check      validate only, write nothing
  *   node tools/build-fs.mjs --release --out /tmp/x write somewhere else
  *   node tools/build-fs.mjs --release --no-deadcode  keep helper funcs
+ *   node tools/build-fs.mjs --config FILE          use a different build config
+ *
+ * The mode (dev or release) decides whether the debug statements are stripped;
+ * it comes from the config's "mode" unless a flag says otherwise.  A release
+ * build also fills the Onshape document ids, which the sources leave blank on
+ * purpose: see the build-config section below.
  *
  * A release build removes:
  *   1. `const DEBUG_FOO = ...;` declarations, and the TEMPORARY/DEBUG note
@@ -45,8 +51,8 @@
  *   string or block comment, an `else` with no `if` in front of it.
  */
 
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join, relative, resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -62,17 +68,23 @@ function fail(message) {
 
 function usage() {
     return [
-        'node tools/build-fs.mjs [--release] [--check] [--no-deadcode] [--out DIR] [file.fs ...]',
+        'node tools/build-fs.mjs [mode] [--check] [--no-deadcode] [--out DIR] [--config FILE] [file.fs ...]',
         '',
-        '  debug (default)  copy osFeature/*.fs with a generated-build banner',
-        '  --release        strip debug statements, flags and orphaned helpers',
-        '  --check          run the release transform + validation, write nothing',
+        '  mode (default from the config, else dev)',
+        '    --dev, --debug    keep the println diagnostics (alias)',
+        '    --release         strip them',
+        '  --check             run the transform + validation, write nothing',
+        '  --no-deadcode       keep helper functions the strip would orphan',
+        '  --out DIR           write somewhere else',
+        `  --config FILE       the build config (default ${BUILD_CONFIG}, untracked)`,
         '',
     ].join('\n');
 }
 
 function parseArgs(argv) {
-    const options = { mode: 'debug', check: false, deadcode: true, out: null, files: [], help: false };
+    // `mode` is null until something asks for one: the config decides, and only
+    // then does the default (dev) apply.
+    const options = { mode: null, check: false, deadcode: true, out: null, files: [], help: false, config: BUILD_CONFIG };
 
     for (let i = 0; i < argv.length; i += 1)
     {
@@ -81,9 +93,9 @@ function parseArgs(argv) {
         {
             options.mode = 'release';
         }
-        else if (arg === '--debug')
+        else if (arg === '--dev' || arg === '--debug')
         {
-            options.mode = 'debug';
+            options.mode = 'dev';
         }
         else if (arg === '--check')
         {
@@ -96,6 +108,10 @@ function parseArgs(argv) {
         else if (arg === '--out')
         {
             options.out = resolve(ROOT, argv[++i] ?? '');
+        }
+        else if (arg === '--config')
+        {
+            options.config = resolve(ROOT, argv[++i] ?? '');
         }
         else if (arg === '--help' || arg === '-h')
         {
@@ -111,9 +127,11 @@ function parseArgs(argv) {
         }
     }
 
-    if (options.check && options.mode !== 'release')
+    // Only catches `--check --dev` here; a config that resolves to dev is caught
+    // in main(), once the mode is known.
+    if (options.check && options.mode === 'dev')
     {
-        fail('--check only makes sense with --release');
+        fail('--check only makes sense for a release build (--release, or "mode": "release")');
     }
 
     return options;
@@ -767,6 +785,188 @@ function removeOrphans(docs) {
 }
 
 
+// -------------------------------------------------------------- build config
+//
+// Two things the sources deliberately do NOT carry, because both belong to the
+// person running the build rather than to the repository:
+//
+//   1. The Onshape *document ids*.  An import naming a Feature Studio tab this
+//      project is pasted into, or an uploaded icon/image, points at an id that
+//      belongs to whoever made that document and changes with every version.
+//      The sources leave them blank and tag the line, and the build fills them:
+//
+//          import(path : "", version : ""); // @import utils
+//
+//      `onshape/std/...` imports are NOT touched: they are released with the
+//      `FeatureScript N;` header, not per document, so they are the same for
+//      everyone and belong in the source.
+//
+//   2. The mode.  `dev` keeps the `println` diagnostics in the output;
+//      `release` strips them.  A command-line flag wins over the config, so CI
+//      can ask for a release build on a checkout that has no config at all.
+
+const BUILD_CONFIG = 'local/build-config.json';
+const BUILD_CONFIG_EXAMPLE = 'tools/build-config.example.json';
+
+const MODES = ['dev', 'release'];
+
+// A whole import statement on one line, capturing the id-bearing parts and the
+// trailing comment separately.  Anchored, so a string merely *containing*
+// "import(" cannot match.
+const IMPORT_STMT = /^([ \t]*)((?:\w+\s*::\s*)?import\s*\(\s*path\s*:\s*)"([^"]*)"(\s*,\s*version\s*:\s*)"([^"]*)"(\s*\))(.*)$/;
+
+// The `// @import <key>` tag on the end of a blank import line.
+const IMPORT_TAG = /@import\s+(\S+)\s*$/;
+
+/**
+ * Read and shape-check the build config.  A missing file is not an error: it
+ * yields a config with no mode and no imports, and the caller decides what that
+ * means (a dev build is fine without one, a release build is not).
+ */
+function loadConfig(path) {
+    const empty = { mode: null, imports: {} };
+    if (!existsSync(path))
+    {
+        return empty;
+    }
+
+    let parsed;
+    try
+    {
+        parsed = JSON.parse(readFileSync(path, 'utf8'));
+    }
+    catch (error)
+    {
+        fail(`${showPath(path)} is not valid JSON: ${error.message}`);
+    }
+
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed))
+    {
+        fail(`${showPath(path)} must be a JSON object`);
+    }
+
+    // An unknown key is an error rather than a shrug: a misspelt "imprts" would
+    // otherwise load as a config with no imports in it, and the ids would go
+    // missing one run later instead of here.
+    const known = new Set(['mode', 'imports']);
+    for (const key of Object.keys(parsed))
+    {
+        if (!known.has(key))
+        {
+            fail(`${showPath(path)}: unknown key "${key}"`
+                + ` (this file takes: ${[...known].join(', ')})`);
+        }
+    }
+
+    let mode = null;
+    if (parsed.mode !== undefined)
+    {
+        if (!MODES.includes(parsed.mode))
+        {
+            fail(`${showPath(path)}: "mode" must be one of ${MODES.join(', ')}`
+                + `, not ${JSON.stringify(parsed.mode)}`);
+        }
+        mode = parsed.mode;
+    }
+
+    const raw = parsed.imports ?? {};
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
+    {
+        fail(`${showPath(path)}: "imports" must be an object of key -> { path, version }`);
+    }
+
+    const imports = {};
+    for (const [key, value] of Object.entries(raw))
+    {
+        if (value === null || typeof value !== 'object' || Array.isArray(value))
+        {
+            fail(`${showPath(path)}: "imports.${key}" must be an object of { path, version }`);
+        }
+        for (const field of ['path', 'version'])
+        {
+            if (typeof value[field] !== 'string' || value[field].trim() === '')
+            {
+                fail(`${showPath(path)}: "imports.${key}.${field}" must be a non-empty string`
+                    + ' -- copy the whole import line out of Feature Studio');
+            }
+        }
+        imports[key] = value;
+    }
+
+    return { mode, imports };
+}
+
+/**
+ * Fill the blank imports in one document.  `imports` may be {}, which leaves
+ * them blank (a debug build with no config yet); `strict` then decides whether
+ * a key it cannot resolve is an error or just left for a later run.  The
+ * release build is always strict, so an unfilled id can never be published.
+ *
+ * Returns { text, used }.  Throws on anything it would otherwise have to guess.
+ */
+function fillImports(text, imports, name, strict = true, configPath = BUILD_CONFIG) {
+    const used = [];
+    const problems = [];
+    let changed = false;
+
+    const out = text.split('\n').map((line, i) => {
+        const match = IMPORT_STMT.exec(line);
+        if (match === null)
+        {
+            return line;
+        }
+
+        const [, indent, head, path, mid, version, tail, comment] = match;
+
+        // The std imports are versioned with the header, not per document.
+        if (path.startsWith('onshape/std/'))
+        {
+            return line;
+        }
+
+        if (path !== '' || version !== '')
+        {
+            problems.push(`line ${i + 1}: a document id is written out in the source.`
+                + ' Leave path and version blank and tag the line `// @import <key>`,'
+                + ` so the id stays in ${configPath}.`);
+            return line;
+        }
+
+        const tag = IMPORT_TAG.exec(comment.trim());
+        if (tag === null)
+        {
+            problems.push(`line ${i + 1}: a blank import with no \`// @import <key>\` tag,`
+                + ' so the build cannot tell which document it means.');
+            return line;
+        }
+
+        const key = tag[1];
+        const entry = imports[key];
+        if (entry === undefined)
+        {
+            if (!strict)
+            {
+                return line; // no config yet: leave it blank, fill it next run
+            }
+            const known = Object.keys(imports).sort().join(', ') || 'none';
+            problems.push(`line ${i + 1}: @import ${key} is not in ${configPath}`
+                + ` (it has: ${known}).`);
+            return line;
+        }
+
+        used.push(key);
+        changed = true;
+        return `${indent}${head}"${entry.path}"${mid}"${entry.version}"${tail}${comment}`;
+    });
+
+    if (problems.length > 0)
+    {
+        fail(`${name}:\n  ${problems.join('\n  ')}`);
+    }
+
+    return { text: changed ? out.join('\n') : text, used };
+}
+
 // --------------------------------------------------------------- banner
 
 // Onshape needs `FeatureScript N;` and the imports at the top of the document,
@@ -776,7 +976,8 @@ function insertBanner(text, header) {
     let last = 0;
     for (let i = 0; i < lines.length; i += 1)
     {
-        if (/^\s*(?:import\s*\(|FeatureScript\s)/.test(lines[i]))
+        // A namespace prefix (`icon::import(...)`) is legal, so allow one.
+        if (/^\s*(?:import\s*\(|\w+\s*::\s*import\s*\(|FeatureScript\s)/.test(lines[i]))
         {
             last = i;
         }
@@ -802,9 +1003,9 @@ function banner(mode, name) {
     }
     return [
         '// ------------------------------------------------------------------',
-        `// GENERATED FILE -- ${name} (debug) -- do not edit; edit osFeature/${name}.`,
-        '// Built by tools/build-fs.mjs. Behaviour is identical to the source; this is',
-        '// just a copy to paste into Feature Studio.',
+        `// GENERATED FILE -- ${name} (dev) -- do not edit; edit osFeature/${name}.`,
+        '// Built by tools/build-fs.mjs in dev mode. Behaviour is identical to the',
+        '// source, diagnostics included; this is a copy to paste into Feature Studio.',
         '// ------------------------------------------------------------------',
     ].join('\n');
 }
@@ -1293,6 +1494,29 @@ function main() {
         return 0;
     }
 
+    // The mode decides whether the debug statements are stripped, so it has to
+    // be settled before anything is read.  A flag on the command line wins over
+    // the config, so CI can ask for a release build on a checkout with no
+    // config; with neither, a dev build is the safe default, because it changes
+    // no code.
+    const config = loadConfig(options.config);
+    const hasConfig = existsSync(options.config);
+    const mode = options.mode ?? config.mode ?? 'dev';
+    const release = mode === 'release';
+
+    if (options.check && !release)
+    {
+        fail('--check only makes sense for a release build (--release, or "mode": "release")');
+    }
+
+    if (release && !hasConfig && !options.check)
+    {
+        process.stderr.write(`build-fs: no ${showPath(options.config)}.  Copy `
+            + `${BUILD_CONFIG_EXAMPLE} to ${showPath(options.config)} and fill it in,\n`
+            + 'or pass --config FILE.  A release build cannot be written without it.\n');
+        return 1;
+    }
+
     const sources = options.files.length > 0
         ? options.files
         : readdirSync(SRC_DIR).filter((f) => f.endsWith('.fs')).sort().map((f) => join('osFeature', f));
@@ -1302,7 +1526,18 @@ function main() {
         fail(`no .fs sources found in ${relative(ROOT, SRC_DIR) || SRC_DIR}`);
     }
 
-    const outDir = options.out ?? join(ROOT, 'dist', 'featurescript', options.mode);
+    // A dev build written into dist/featurescript/release is the worst failure
+    // this tool can have: nothing is stripped, it still logs, and it sits where
+    // a reader assumes it is ready to paste into Feature Studio.
+    const outDir = options.out ?? join(ROOT, 'dist', 'featurescript', mode);
+
+    if (!release && outDir.endsWith(`${sep}release`))
+    {
+        process.stderr.write(`build-fs: refusing to write a dev build to ${showPath(outDir)}.\n`
+            + 'A file with its debug statements still in it must not sit in the release\n'
+            + 'folder.  Use --release, or --out to write somewhere else.\n');
+        return 1;
+    }
     const docs = [];
     const removedNames = [];
     let failed = false;
@@ -1314,7 +1549,7 @@ function main() {
         docs.push({ rel, name, source, text: source, notes: [] });
     }
 
-    if (options.mode === 'release')
+    if (release)
     {
         // Phase one, per file: the debug statements.
         for (const doc of docs)
@@ -1357,11 +1592,53 @@ function main() {
     {
         for (const doc of docs)
         {
-            doc.text = insertBanner(doc.source, banner('debug', doc.name));
+            doc.text = insertBanner(doc.source, banner('dev', doc.name));
         }
     }
 
-    if (options.mode === 'release')
+    // The document ids go in last, so neither the strip nor the banner can ever
+    // be the thing that has to recognise a namespaced or blank import.
+    //
+    // Only a build that WRITES needs the ids: a file pasted into Feature Studio
+    // with `path : ""` imports nothing.  A `--check` run does not, because CI has
+    // a fresh checkout and no config, and the ids are untracked by design.  It
+    // still checks everything about them that does not need the config -- a
+    // hard-coded id, a missing tag -- so the regression this mechanism exists to
+    // prevent is still caught there.
+    const strict = release && hasConfig;
+    const usedKeys = new Set();
+    for (const doc of docs)
+    {
+        try
+        {
+            const filled = fillImports(doc.text, config.imports, doc.name, strict,
+                showPath(options.config));
+            doc.text = filled.text;
+            for (const key of filled.used)
+            {
+                usedKeys.add(key);
+            }
+        }
+        catch (error)
+        {
+            process.stderr.write(`build-fs: ${error.message}\n`);
+            return 1;
+        }
+    }
+
+    const unusedKeys = Object.keys(config.imports).filter((key) => !usedKeys.has(key));
+    if (unusedKeys.length > 0)
+    {
+        process.stdout.write(`note: ${showPath(options.config)} has `
+            + `${unusedKeys.length} import key(s) no document asks for: ${unusedKeys.join(', ')}\n`);
+    }
+    else if (!hasConfig)
+    {
+        process.stdout.write(`note: no ${showPath(options.config)}; the document ids are `
+            + 'left blank, so this build is not pasteable into Feature Studio\n');
+    }
+
+    if (release)
     {
         for (const doc of docs)
         {
@@ -1387,7 +1664,7 @@ function main() {
     for (const doc of docs)
     {
         process.stdout.write(`${doc.problems.length > 0 ? 'FAIL' : 'ok  '}  ${doc.rel}\n`);
-        if (options.mode === 'release')
+        if (release)
         {
             for (const note of doc.notes)
             {
@@ -1421,9 +1698,9 @@ function main() {
         writeFileSync(join(outDir, doc.name), tidy(doc.text));
     }
 
-    process.stdout.write(`\n${options.mode} build -> ${showPath(outDir)}: `
+    process.stdout.write(`\n${mode} build -> ${showPath(outDir)}: `
         + `${docs.length} file${docs.length === 1 ? '' : 's'}, ${sourceLines} -> ${outputLines} lines`
-        + (options.mode === 'release' ? `, ${removed} debug constructs stripped` : '') + '\n');
+        + (release ? `, ${removed} debug constructs stripped` : '') + '\n');
 
     return 0;
 }
@@ -1431,9 +1708,14 @@ function main() {
 // Imported by the tests: the transform runs only when this file is the entry
 // point, so importing it has no side effects.
 export {
+    BUILD_CONFIG,
+    BUILD_CONFIG_EXAMPLE,
     BuildError,
+    MODES,
     banner,
+    fillImports,
     insertBanner,
+    loadConfig,
     main,
     maskSource,
     removeOrphans,

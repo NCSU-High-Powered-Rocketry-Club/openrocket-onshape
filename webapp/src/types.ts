@@ -173,6 +173,25 @@ export interface MotorConfiguration {
   length: number;
 }
 
+/**
+ * One rocket-level `<motorconfiguration>`: a flight configuration, which is what
+ * decides which `<motor>` each motor mount actually has loaded.
+ *
+ * `Rocket.motorConfigurations` lists them all so the choice is inspectable
+ * rather than silent, and so the webapp can offer a dropdown the way it offers
+ * one for the center of pressure.
+ */
+export interface RocketMotorConfiguration {
+  /** `configid` attribute; the key every `<motor configid="...">` links by. */
+  configId: string;
+  /** `<name>`; '' when the file does not override the configuration's name. */
+  name: string;
+  /** True for the one written as `<motorconfiguration default="true">`. */
+  isDefault: boolean;
+  /** Every `<stage number active>` in the configuration, in document order. */
+  stages: Array<{ number: number; active: boolean }>;
+}
+
 export interface MotorMountParams {
   overhang: number;
   designation: string;
@@ -192,6 +211,13 @@ export interface MotorMountParams {
   configurationCount?: number;
   /** Every configuration's motor, in document order. Selected one first in use. */
   configurations?: MotorConfiguration[];
+  /**
+   * `configid` of the `<motor>` that won, and whose `designation`/`diameter`/
+   * `length` are the ones above. '' when no configuration matched and the first
+   * motor was taken as the fallback, so a consumer can tell "no motor" from
+   * "the first motor by default".
+   */
+  selectedConfigId: string;
 }
 
 export interface BodyTubeParams {
@@ -388,8 +414,24 @@ export interface RocketComponent {
   id: string;
   /** Estimated mass in kg, when the component has a computable material and volume. */
   mass?: number;
+  /**
+   * The component's own deliberate mass, from `<overridemass>` (kg).
+   *
+   * This is a *user-set* value — typically a ballast modelling decision — so it
+   * wins over the geometric estimate that would otherwise be written to `mass`.
+   * `undefined` means the file did not override, which is the common case;
+   * OpenRocket only writes the element when `isMassOverridden()` is true.
+   */
+  overrideMass?: number;
+  /**
+   * Deliberate CG position (m) and drag coefficient, from `<overridecg>` and
+   * `<overridecd>`. Simulation metadata with no geometry in Onshape, so these
+   * are carried for fidelity only — nothing in the FeatureScript reads them.
+   */
+  overrideCG?: number;
+  overrideCD?: number;
   material?: Material;
-  color?: Color; // RGBA (0..1) from <appearance><paint .../>; matches the Onshape Color API; undefined if unpainted
+  color?: Color; // RGBA (0..1) from <appearance><paint .../> or <color .../>; matches the Onshape Color API; undefined if unpainted
   position: Position;
   params:
     | SymmetricParams
@@ -472,6 +514,18 @@ export interface Rocket {
   centerOfPressureSource?: number;
   /** Every usable CP sample, one entry per flight-data branch. Diagnostic only. */
   centerOfPressureBranches?: CenterOfPressureBranch[];
+  /**
+   * Every flight configuration the file declares, in document order, with the
+   * default flagged. The webapp renders these as the motor-configuration
+   * dropdown; nothing in the FeatureScript reads them.
+   */
+  motorConfigurations?: RocketMotorConfiguration[];
+  /**
+   * `configId` of the configuration whose motors every `MotorMountParams` was
+   * resolved against -- the file's `default="true"` unless the user picked
+   * another one. Undefined when the file declares no configurations.
+   */
+  motorConfigurationSource?: string;
 }
 
 export type WarningSeverity = 'info' | 'error' | 'high' | 'medium' | 'low';

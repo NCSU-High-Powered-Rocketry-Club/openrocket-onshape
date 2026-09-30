@@ -1353,6 +1353,104 @@ describe('auto-radius resolution', () => {
     expect((nose.params as any).aftRadius).toBeCloseTo(0.03, 6);
   });
 
+  it('skips a nose cone whose base is STILL automatic (auto does not chain from junk)', () => {
+    // The audit's #6 reproduction. Java's `Transition.getFrontAutoRadius()`
+    // returns -1 while the aft radius is automatic, so `BodyTube.getAutoOuterRadius()`
+    // skips the nose cone entirely and takes the FOLLOWING tube's radius.
+    //
+    // The stored values are deliberately NOT what OpenRocket resolves to, so the
+    // coincidence that hid this in the real corpus cannot mask a regression:
+    // the nose cone holds 0.0125 and the body tube must end up at 0.03.
+    const nose = comp('nosecone', 'NC', {
+      shape: 'conical',
+      shapeParameter: 0,
+      length: 0.05,
+      foreRadius: 0,
+      aftRadius: 0.0125, // stale stored value, <aftradius>auto 0.0125</aftradius>
+      foreRadiusAutomatic: false,
+      baseRadiusAutomatic: true,
+    });
+    const bodyAuto = comp('bodytube', 'BT-auto', { outerRadius: 0.0125, autoOuterRadius: true });
+    const bodyFixed = comp('bodytube', 'BT-fixed', { outerRadius: 0.03 });
+
+    computeDerivedData(makeJson([nose, bodyAuto, bodyFixed]));
+
+    // NOT 0.0125 — the nose cone is still automatic and cannot be a source.
+    expect((bodyAuto.params as any).outerRadius).toBeCloseTo(0.03, 6);
+    // The nose cone's own base then resolves from the tube in front of it,
+    // which is the auto tube, now resolved.
+    expect((nose.params as any).aftRadius).toBeCloseTo(0.03, 6);
+  });
+
+  it('still chains a resolved auto body tube into the next auto component', () => {
+    // Regression guard for the fix above. `autoOuterRadius` is a parser flag
+    // that is never cleared, so treating "flag set" as "still unresolved" would
+    // break this legitimate case: BT2 must take BT1's *resolved* radius.
+    //
+    // The stored values are all DIFFERENT (BT1 anchors to the fixed 0.04, BT2
+    // holds junk 0.09), so each expectation discriminates. Under the naive
+    // "any autoOuterRadius → -1" rule BT1 would be treated as unresolved, BT2
+    // would find no usable previous component, and BT2 would stay at 0.09.
+    const fixed = comp('bodytube', 'BT0', { outerRadius: 0.04 });
+    const bodyA = comp('bodytube', 'BT1', { outerRadius: 0.04, autoOuterRadius: true });
+    const bodyB = comp('bodytube', 'BT2', { outerRadius: 0.09, autoOuterRadius: true });
+    computeDerivedData(makeJson([fixed, bodyA, bodyB]));
+    expect((bodyA.params as any).outerRadius).toBeCloseTo(0.04, 6);
+    expect((bodyB.params as any).outerRadius).toBeCloseTo(0.04, 6);
+  });
+
+  it('resolves an auto base from the next tube when the middle tube is auto and resolvable', () => {
+    // NC(auto base) → BT(auto) → BT(0.03). The middle tube resolves from the
+    // nose cone's junk-free side only if the nose cone is NOT automatic; here
+    // it is, so the middle tube takes 0.03, and the nose cone's base — being
+    // read from the front — then matches. One resolution, no junk anywhere.
+    const nose = comp('nosecone', 'NC', {
+      shape: 'conical',
+      shapeParameter: 0,
+      length: 0.05,
+      foreRadius: 0,
+      aftRadius: 0.001,
+      foreRadiusAutomatic: false,
+      baseRadiusAutomatic: true,
+    });
+    const bodyAuto = comp('bodytube', 'BT-auto', { outerRadius: 0.001, autoOuterRadius: true });
+    const bodyFixed = comp('bodytube', 'BT-fixed', { outerRadius: 0.03 });
+    computeDerivedData(makeJson([nose, bodyAuto, bodyFixed]));
+    expect((bodyAuto.params as any).outerRadius).toBeCloseTo(0.03, 6);
+  });
+
+  it('recurses forward past a run of auto tubes to the first concrete one', () => {
+    // The `Dual parachute deployment.ork` shape: nose(auto base) then a run of
+    // auto tubes, with one concrete tube further back. Java's
+    // `BodyTube.getRearAutoRadius()` recurses forward, so every tube in the run
+    // lands on the concrete value. A naive "skip the auto neighbour and warn"
+    // fix instead strands them on their `auto 0.025` placeholders.
+    const nose = comp('nosecone', 'NC', {
+      shape: 'conical',
+      shapeParameter: 0,
+      length: 0.28321,
+      foreRadius: 0,
+      aftRadius: 0.028321,
+      foreRadiusAutomatic: false,
+      baseRadiusAutomatic: true,
+    });
+    const t1 = comp('bodytube', 'BT1', { outerRadius: 0.025, autoOuterRadius: true });
+    const t2 = comp('bodytube', 'BT2', { outerRadius: 0.025, autoOuterRadius: true });
+    const fixed = comp('bodytube', 'BT-fixed', { outerRadius: 0.028321 });
+    const t3 = comp('bodytube', 'BT3', { outerRadius: 0.025, autoOuterRadius: true });
+
+    const json = makeJson([nose, t1, t2, fixed, t3]);
+    computeDerivedData(json);
+
+    // The nose cone cannot serve BT1 (its base is still auto), and BT1's own
+    // stored 0.025 is junk, so the search continues down the chain to BT-fixed.
+    expect((t1.params as any).outerRadius).toBeCloseTo(0.028321, 9);
+    expect((t2.params as any).outerRadius).toBeCloseTo(0.028321, 9);
+    expect((t3.params as any).outerRadius).toBeCloseTo(0.028321, 9);
+    // No spurious warnings: every auto end found a concrete source.
+    expect(json.warnings.filter((w) => w.includes('auto'))).toEqual([]);
+  });
+
   it('does not overwrite a manual (non-auto) transition fore radius', () => {
     const body = comp('bodytube', 'BT', { outerRadius: 0.045 });
     const trans = comp('transition', 'Trans', {

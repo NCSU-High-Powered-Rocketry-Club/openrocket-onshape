@@ -142,10 +142,10 @@
     .warning-medium strong { color: var(--warning); }
     .warning-low strong { color: var(--onshape); }
     .warning-info strong { color: var(--success); }
-    #cpPicker { margin-top: 1.1rem; padding-top: 1rem; border-top: 1px solid var(--border); }
-    #cpPicker h3 { margin: 0 0 .6rem; font-size: .95rem; }
+    .picker { margin-top: 1.1rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+    .picker h3 { margin: 0 0 .6rem; font-size: .95rem; }
     .field-label { display: block; font-size: .78rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: .3rem; }
-    #cpSourceSelect { width: 100%; padding: .5rem .6rem; font: inherit; color: var(--text); background: var(--panel-alt); border: 1px solid var(--border); border-radius: 6px; }
+    .picker select { width: 100%; padding: .5rem .6rem; font: inherit; color: var(--text); background: var(--panel-alt); border: 1px solid var(--border); border-radius: 6px; }
     .note { margin: .6rem 0 0; font-size: .82rem; line-height: 1.5; color: var(--muted); }
     .note code { font-size: .95em; }
   </style>
@@ -167,7 +167,7 @@
     <section class="card hidden" id="summaryCard">
       <h2>Parsed Design</h2>
       <div id="summaryGrid"></div>
-      <div class="hidden" id="cpPicker">
+      <div class="hidden picker" id="cpPicker">
         <h3>Center of pressure</h3>
         <label class="field-label" for="cpSourceSelect">Take the CP from</label>
         <select id="cpSourceSelect"></select>
@@ -177,6 +177,19 @@
           anything below Mach 0.05. It is <b>not</b> the static CP that OpenRocket's design view draws:
           that one is the worst case over 360 roll angles at Mach 0.3 and zero angle of attack, and it
           can sit tens of millimetres forward of this number.
+        </p>
+      </div>
+      <div class="hidden picker" id="motorPicker">
+        <h3>Motor configuration</h3>
+        <label class="field-label" for="motorConfigSelect">Load the motors from</label>
+        <select id="motorConfigSelect"></select>
+        <p class="note">
+          A rocket can define one motor per flight configuration. This picks which configuration's
+          motors are built — OpenRocket's default is preselected, and picking another re-reads the file
+          so the motor in <b>every</b> mount changes, not just this one. Each option shows the motors
+          that configuration loads, across all mounts. The digest behind each motor is what OpenRocket
+          uses to recover the motor's mass; the mass itself is not in the .ork, so the Onshape feature
+          asks for it separately.
         </p>
       </div>
     </section>

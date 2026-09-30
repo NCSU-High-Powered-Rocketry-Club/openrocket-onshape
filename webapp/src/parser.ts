@@ -50,6 +50,7 @@ import type {
   Shoulder,
   MotorMountParams,
   MotorConfiguration,
+  RocketMotorConfiguration,
   BodyTubeParams,
   TrapezoidFinParams,
   EllipticalFinParams,
@@ -285,26 +286,45 @@ function parsePosition(
 // ---------- Appearance / color parsing ----------
 
 /**
- * Extract the component's color from its <appearance> block:
- *   <appearance><paint red="255" green="102" blue="0" alpha="0"/></appearance>
- * Returns an RGBA object with each channel between 0 and 1 (inclusive),
- * matching the Onshape `Color` API, or undefined if no paint is defined.
+ * Extract the component's color, as RGBA with each channel between 0 and 1
+ * (inclusive), matching the Onshape `Color` API. Returns undefined if neither
+ * source is present, so the caller can fall back to a material guess.
+ *
+ * Two independent elements can carry a color, and OpenRocket writes them
+ * separately:
+ *
+ *   - `<color red="255" green="0" blue="0" alpha="255"/>` — the *figure* color
+ *     (`RocketComponent.getColor()`), emitted by `RocketComponentSaver` for any
+ *     component that is neither the Rocket nor an assembly.
+ *   - `<appearance><paint .../></appearance>` — the render appearance
+ *     (`getAppearance().getPaint()`).
+ *
+ * A component can legitimately have either, both, or neither: the saver emits
+ * each independently, so a file whose only colour is `<color>` would otherwise
+ * have lost its paint entirely and fallen back to a material guess — a
+ * plausible but wrong display colour. The appearance is preferred when both are
+ * present because it is the one the appearance editor actually sets. (In the
+ * 7 test rockets all 3 `<color>` elements happen to sit beside an `<appearance>`,
+ * so this fallback is currently latent rather than live; a hand-edited or
+ * older-format file is what it is here for.)
  */
-function parseAppearanceColor(
+function parseComponentColor(
   el: Record<string, unknown>
 ): RocketComponent['color'] | undefined {
-  const appearance = el['appearance'] as Record<string, unknown> | undefined;
-  if (!appearance || typeof appearance !== 'object') return undefined;
-  const paint = appearance['paint'] as Record<string, unknown> | undefined;
-  if (!paint || typeof paint !== 'object') return undefined;
+  const paint = el['appearance'] as Record<string, unknown> | undefined;
+  const source =
+    paint && typeof paint === 'object'
+      ? (paint['paint'] as Record<string, unknown> | undefined)
+      : (el['color'] as Record<string, unknown> | undefined);
+  if (!source || typeof source !== 'object') return undefined;
   const channel = (v: unknown) =>
     Math.min(1, Math.max(0, parseNum(v, 0) / 255));
   return {
-    red: channel(paint['@_red']),
-    green: channel(paint['@_green']),
-    blue: channel(paint['@_blue']),
+    red: channel(source['@_red']),
+    green: channel(source['@_green']),
+    blue: channel(source['@_blue']),
     // Alpha in .ork files is on the same 0-255 scale as the color channels
-    alpha: Math.min(1, Math.max(0, parseNum(paint['@_alpha'], 255) / 255)),
+    alpha: Math.min(1, Math.max(0, parseNum(source['@_alpha'], 255) / 255)),
   };
 }
 
@@ -428,45 +448,78 @@ function parseSymmetricParams(el: Record<string, unknown>, isNoseCone = false): 
 }
 
 /**
- * The `configid` of the rocket's DEFAULT motor configuration.
+ * Every rocket-level `<motorconfiguration>`, in document order.
  *
- * A `<motormount>` holds one `<motor>` per flight configuration, each tagged
- * with the `configid` it belongs to, and the rocket-level
- * `<motorconfiguration configid="..." default="true">` names which of those
- * configurations the designer considers the default one. That mapping is what
- * says WHICH motor is actually loaded — `motors[0]` is only the first one
- * written, which is document order and nothing more.
+ * These are OpenRocket's flight configurations -- the old tag name is preserved
+ * for backwards compatibility (see `RocketSaver`). Each one is a candidate for
+ * "which motors are loaded", and each carries the stage activeness that tells a
+ * single-stage rocket from a booster with a live sustainer and a spent booster,
+ * so the webapp can label the dropdown with something better than a bare UUID.
+ * The `<name>` is only written when the designer overrode it, hence the ''
+ * fallback.
+ *
+ * This pairing is what says WHICH motor is actually loaded. A `<motormount>`
+ * holds one `<motor>` per configuration, each tagged with the `configid` it
+ * belongs to, and the `default="true"` flag below says which of those
+ * configurations the designer considers the default one. `motors[0]` is only
+ * the first one written, which is document order and nothing more.
  *
  * They differ on 4 of the 7 test rockets: `demon 54.ork` opens with H250G but
  * its default configuration is I200W; `Antar` opens with C6, default D20W;
  * `Bell X-1` D12 vs E12; `ExamplePods` A8 vs C6. Taking `motors[0]` therefore
  * drew the wrong motor on more than half the corpus.
- *
- * Returns '' when the file declares no default, in which case the caller falls
- * back to the first motor rather than to no motor at all.
  */
-function defaultMotorConfigId(rocketEl: Record<string, unknown>): string {
-  const configs = toArray<Record<string, unknown>>(
+function parseMotorConfigurations(rocketEl: Record<string, unknown>): RocketMotorConfiguration[] {
+  return toArray<Record<string, unknown>>(
     rocketEl['motorconfiguration'] as Record<string, unknown> | Record<string, unknown>[] | undefined
-  );
-  for (const cfg of configs) {
-    if (parseBool(cfg['@_default'], false)) return attr(cfg, 'configid');
-  }
-  return '';
+  ).map((cfg) => ({
+    configId: attr(cfg, 'configid'),
+    name: str(cfg, 'name'),
+    isDefault: parseBool(cfg['@_default'], false),
+    stages: toArray<Record<string, unknown>>(
+      cfg['stage'] as Record<string, unknown> | Record<string, unknown>[] | undefined
+    ).map((stage) => ({
+      number: parseNum(attr(stage, 'number'), 0),
+      active: parseBool(attr(stage, 'active'), false),
+    })),
+  }));
 }
 
 /**
- * Resolve one `<motormount>`: the motor belonging to the default configuration,
+ * The `configid` every motor mount should be resolved against.
+ *
+ * A user pick wins over the file's `default="true"`: the dropdown exists so a
+ * designer can build the *other* flight configuration, and re-resolving from
+ * scratch is what makes the whole payload -- not just a patched motor block --
+ * agree with that choice. A pick that names a configuration the file does not
+ * declare falls back to the default rather than silently resolving to nothing.
+ */
+function selectMotorConfigId(configs: RocketMotorConfiguration[], requested?: string): string {
+  if (requested && configs.some((c) => c.configId === requested)) return requested;
+  return configs.find((c) => c.isDefault)?.configId ?? '';
+}
+
+/**
+ * Resolve one `<motormount>`: the motor belonging to the selected configuration,
  * plus the full candidate list so a caller can see what else was on offer.
  *
- * Falls back to the first motor when the default configuration loads nothing
- * into this mount — a booster that is parked in some configurations but loaded
- * in the default one is the normal case for a two-stage rocket, and dropping the
- * motor entirely there would delete a motor the file clearly defines.
+ * When NO configuration could be resolved at all (the file declares none, or
+ * none is flagged default) the first motor is taken, because a mount that
+ * defines motors clearly has one loaded and reporting none would be a worse
+ * answer than a possibly-wrong one.
+ *
+ * But once a configuration IS resolved, a mount that declares no motor for it
+ * genuinely has nothing loaded there -- a booster parked for this flight, say --
+ * and that is reported as no motor. Falling back to the first motor in that case
+ * would fabricate geometry for a motor this configuration never loads: the old
+ * code could get away with it because the default configuration loads a motor in
+ * every mount by definition, but it is wrong as soon as the user picks a
+ * different one. `Kerbal.ork` has three such configurations, and each used to
+ * silently build the default's C6.
  */
 function parseMotorMount(
   mm: Record<string, unknown>,
-  defaultConfigId: string
+  selectedConfigId: string
 ): MotorMountParams {
   const motors = toArray<Record<string, unknown>>(
     mm['motor'] as Record<string, unknown> | Record<string, unknown>[] | undefined
@@ -482,8 +535,9 @@ function parseMotorMount(
   }));
 
   const selected =
-    candidates.find((c) => defaultConfigId !== '' && c.configId === defaultConfigId) ??
-    candidates[0];
+    selectedConfigId !== ''
+      ? candidates.find((c) => c.configId === selectedConfigId)
+      : candidates[0];
 
   return {
     overhang: num(mm, 'overhang'),
@@ -495,10 +549,13 @@ function parseMotorMount(
     ignitionDelay: num(mm, 'ignitiondelay'),
     configurationCount: motors.length,
     ...(candidates.length > 0 ? { configurations: candidates } : {}),
+    // '' when the fallback fired, so "took the first motor" is distinguishable
+    // from "this configuration loads a motor here".
+    selectedConfigId: selected?.configId ?? '',
   };
 }
 
-function parseBodyTubeParams(el: Record<string, unknown>, defaultConfigId: string): BodyTubeParams {
+function parseBodyTubeParams(el: Record<string, unknown>, selectedConfigId: string): BodyTubeParams {
   const thicknessRaw = str(el, 'thickness');
   const filled = isFilled(thicknessRaw);
 
@@ -509,7 +566,7 @@ function parseBodyTubeParams(el: Record<string, unknown>, defaultConfigId: strin
   let motorMount: BodyTubeParams['motorMount'];
   if (el['motormount']) {
     const mm = el['motormount'] as Record<string, unknown>;
-    motorMount = parseMotorMount(mm, defaultConfigId);
+    motorMount = parseMotorMount(mm, selectedConfigId);
   }
 
   return {
@@ -626,10 +683,27 @@ function parseTubeFinParams(el: Record<string, unknown>): TubeFinParams {
 }
 
 function parseLaunchLugParams(el: Record<string, unknown>): LaunchLugParams {
+  // `LaunchLugSaver` writes only <radius>, <length> and <thickness>; it never
+  // writes <innerradius>, because the bore is not an independent quantity --
+  // `LaunchLug.getInnerRadius()` DERIVES it as `radius - thickness`. So a file
+  // written by any OpenRocket version can never carry the element, and reading
+  // it yields 0 for every real lug. Reading the derived value here (rather than
+  // leaving it 0) is what makes the lug an annulus in the mass estimate instead
+  // of a solid disc, which overstated it by 1.9x-5.4x.
+  const outerRadius = parseNum(el['radius'] ?? el['outerradius'], 0);
+  const thickness = num(el, 'thickness');
+  // `setThickness` clamps to [0, radius], so this is >= 0 for any real file; the
+  // max() only guards a hand-edited one.
+  const derivedInnerRadius = Math.max(0, outerRadius - thickness);
+  // An explicit <innerradius> would be a hand-edit (or another writer's), so it
+  // still wins -- but it is floored the same way, to keep a negative bore from
+  // producing a negative volume.
+  const innerRadius = Math.max(0, num(el, 'innerradius', derivedInnerRadius));
+
   return {
-    outerRadius: parseNum(el['radius'] ?? el['outerradius'], 0),
-    innerRadius: num(el, 'innerradius'),
-    thickness: num(el, 'thickness'),
+    outerRadius,
+    innerRadius,
+    thickness,
     length: num(el, 'length'),
   };
 }
@@ -649,11 +723,11 @@ function parseRailButtonParams(el: Record<string, unknown>): RailButtonParams {
 
 function parseRingComponentParams(
   el: Record<string, unknown>,
-  defaultConfigId: string
+  selectedConfigId: string
 ): RingComponentParams {
   let motorMount: RingComponentParams['motorMount'];
   if (el['motormount']) {
-    motorMount = parseMotorMount(el['motormount'] as Record<string, unknown>, defaultConfigId);
+    motorMount = parseMotorMount(el['motormount'] as Record<string, unknown>, selectedConfigId);
   }
 
   const outerRadiusAuto = isAuto(el['outerradius']);
@@ -824,7 +898,7 @@ function parseComponent(
   warnings: string[],
   type: ComponentType,
   order: OrderLevel = EMPTY_ORDER,
-  defaultConfigId = ''
+  selectedConfigId = ''
 ): RocketComponent {
   const material = parseMaterial(el['material'] as Record<string, unknown> | undefined);
 
@@ -838,7 +912,7 @@ function parseComponent(
       params = parseSymmetricParams(el);
       break;
     case 'bodytube':
-      params = parseBodyTubeParams(el, defaultConfigId);
+      params = parseBodyTubeParams(el, selectedConfigId);
       break;
     case 'trapezoidfinset':
       params = parseTrapezoidFinParams(el);
@@ -863,7 +937,7 @@ function parseComponent(
     case 'centeringring':
     case 'bulkhead':
     case 'engineblock':
-      params = parseRingComponentParams(el, defaultConfigId);
+      params = parseRingComponentParams(el, selectedConfigId);
       break;
     case 'parachute':
     case 'streamer':
@@ -882,15 +956,30 @@ function parseComponent(
 
   const name = str(el, 'name') || type;
 
+  // `<overridemass>` / `<overridecg>` / `<overridecd>` are written by
+  // RocketComponentSaver only when the corresponding `isXxxOverridden()` is
+  // true, so an absent element means "not overridden" rather than zero. Each
+  // `<overridesubcomponentsXxx>` sibling is a boolean the saver always emits
+  // alongside its parent; it is not surfaced here because the web app does not
+  // roll child masses up into a parent total.
+  const overrideMass = num(el, 'overridemass');
+  const overrideCG = num(el, 'overridecg');
+  const overrideCD = num(el, 'overridecd');
+
   return {
     type,
     name,
     id: str(el, 'id'),
     material,
-    color: parseAppearanceColor(el) ?? guessMaterialColor(material),
+    color: parseComponentColor(el) ?? guessMaterialColor(material),
+    // Only carry an override when the element was actually present, so that
+    // "overridden to exactly 0" stays distinguishable from "not overridden".
+    ...(el['overridemass'] !== undefined ? { overrideMass } : {}),
+    ...(el['overridecg'] !== undefined ? { overrideCG } : {}),
+    ...(el['overridecd'] !== undefined ? { overrideCD } : {}),
     position: parsePosition(el, type, warnings, name),
     params,
-    children: parseChildren(el, warnings, order, defaultConfigId),
+    children: parseChildren(el, warnings, order, selectedConfigId),
   };
 }
 
@@ -898,7 +987,7 @@ function parseChildren(
   el: Record<string, unknown>,
   warnings: string[],
   order: OrderLevel = EMPTY_ORDER,
-  defaultConfigId = ''
+  selectedConfigId = ''
 ): RocketComponent[] {
   const sub = el['subcomponents'];
   if (sub === undefined || typeof sub !== 'object') return [];
@@ -929,7 +1018,7 @@ function parseChildren(
     )[occurrence];
     if (typeof c === 'object') {
       components.push(
-        parseComponent(c, warnings, type, order.children[i], defaultConfigId)
+        parseComponent(c, warnings, type, order.children[i], selectedConfigId)
       );
     }
   }
@@ -1070,6 +1159,13 @@ export interface ParseOrkOptions {
    * Defaults to the first branch that carries usable data.
    */
   centerOfPressureBranch?: number;
+  /**
+   * Which flight configuration to load motors from, as the `configId` of one of
+   * `rocket.motorConfigurations`. The UI exposes this so the user can build a
+   * configuration other than the file's `default="true"` one; an id the file
+   * does not declare falls back to the default. Omitted means "use the default".
+   */
+  motorConfiguration?: string;
 }
 
 /**
@@ -1111,11 +1207,14 @@ export async function parseOrkFile(buffer: ArrayBuffer, options: ParseOrkOptions
   warnings.push(`OpenRocket file format version: ${version}`);
 
   // 3. Build the RocketJson
-  // The default motor configuration is resolved ONCE, at the rocket level, and
-  // handed down: it is a property of the rocket, not of any one mount, and every
-  // mount has to be resolved against the same one.
-  const defaultMotorConfig = defaultMotorConfigId(rocketEl);
-  const components = parseChildren(rocketEl, warnings, rocketOrder, defaultMotorConfig);
+  // The motor configuration is resolved ONCE, at the rocket level, and handed
+  // down: it is a property of the rocket, not of any one mount, and every mount
+  // has to be resolved against the same one. The file's default is used unless
+  // the caller asked for another, so the webapp can switch configurations by
+  // re-parsing rather than by patching the JSON afterwards.
+  const motorConfigurations = parseMotorConfigurations(rocketEl);
+  const selectedMotorConfig = selectMotorConfigId(motorConfigurations, options.motorConfiguration);
+  const components = parseChildren(rocketEl, warnings, rocketOrder, selectedMotorConfig);
   const { centerOfPressure, centerOfPressureSource, centerOfPressureBranches } =
     parseCenterOfPressure(rocketEl, root, options.centerOfPressureBranch);
 
@@ -1133,6 +1232,10 @@ export async function parseOrkFile(buffer: ArrayBuffer, options: ParseOrkOptions
     ...(centerOfPressureSource !== undefined ? { centerOfPressureSource } : {}),
     // Diagnostic only; the FeatureScript reads `centerOfPressure`, never this.
     ...(centerOfPressureBranches.length > 0 ? { centerOfPressureBranches } : {}),
+    // Also diagnostic: the motors themselves are already resolved into each
+    // mount's `motorMount`, which is what the FeatureScript reads.
+    ...(motorConfigurations.length > 0 ? { motorConfigurations } : {}),
+    ...(selectedMotorConfig ? { motorConfigurationSource: selectedMotorConfig } : {}),
   };
 
   return {
