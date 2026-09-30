@@ -40,6 +40,13 @@ jobs:
         working-directory: webapp
         run: npm run build
 
+      # The FeatureScript has no compiler of its own, so this is the only thing
+      # that catches a release build that would not paste into Feature Studio.
+      - name: Check the FeatureScript release build
+        run: |
+          npm run fs:test
+          npm run fs:check
+
       - name: Setup Pages
         uses: actions/configure-pages@v6
 

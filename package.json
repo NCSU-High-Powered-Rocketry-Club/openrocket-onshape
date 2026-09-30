@@ -1,0 +1,13 @@
+{
+  "name": "openrocket-onshape",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenRocket .ork to Onshape: static web app (webapp/) + FeatureScript exporter (osFeature/)",
+  "type": "module",
+  "scripts": {
+    "fs:debug": "node tools/build-fs.mjs",
+    "fs:release": "node tools/build-fs.mjs --release",
+    "fs:check": "node tools/build-fs.mjs --release --check",
+    "fs:test": "node --test \"tools/*.test.mjs\""
+  }
+}

@@ -1,3 +1,5 @@
 openrocket-unstable/*
 */node_modules/*
 */dist/*
+dist/
+local/

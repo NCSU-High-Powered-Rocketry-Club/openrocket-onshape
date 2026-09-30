@@ -39,6 +39,7 @@
 
 import JSZip from 'jszip';
 import { XMLParser } from 'fast-xml-parser';
+import { guessMaterialColor } from './colors';
 import type {
   RocketJson,
   RocketComponent,
@@ -46,6 +47,9 @@ import type {
   Material,
   Position,
   SymmetricParams,
+  Shoulder,
+  MotorMountParams,
+  MotorConfiguration,
   BodyTubeParams,
   TrapezoidFinParams,
   EllipticalFinParams,
@@ -60,7 +64,9 @@ import type {
   AngleMethod,
   RadiusMethod,
   FinCrossSection,
+  FinTabPositionMethod,
   SymmetricShape,
+  CenterOfPressureBranch,
 } from './types';
 
 // ---------- XML parsing helpers ----------
@@ -184,7 +190,46 @@ function parseMaterial(el: Record<string, unknown> | undefined): Material | unde
 
 // ---------- Position parsing ----------
 
-function parsePosition(el: Record<string, unknown>): Position {
+/** The `method` attribute of `<angleoffset>`, validated against what we honour. */
+function parseAngleMethod(method: string, warnings: string[], name: string): AngleMethod {
+  if (method === '' || method === 'relative') return 'relative';
+  if (method === 'fixed') return 'fixed';
+  // OpenRocket's AngleMethod also has MIRROR_XY, but `choices()` returns only
+  // RELATIVE and no writer emits it, so this can only be a hand-edit. Fall back
+  // to `relative` -- what the FeatureScript already did by ignoring the value --
+  // and say so, rather than building a silently-wrong angle.
+  warnings.push(
+    `[MEDIUM] ${name}: <angleoffset method="${method}"> is not supported — treated as ` +
+      `"relative". OpenRocket's own UI cannot produce this value.`
+  );
+  return 'relative';
+}
+
+/** The `method` attribute of `<radiusoffset>`, validated against what we honour. */
+function parseRadiusMethod(
+  method: string,
+  isRingAssembly: boolean,
+  warnings: string[],
+  name: string
+): RadiusMethod {
+  const fallback: RadiusMethod = isRingAssembly ? 'relative' : 'coaxial';
+  if (method === '') return fallback;
+  if (method === 'coaxial' || method === 'free' || method === 'relative' || method === 'surface') {
+    return method;
+  }
+  warnings.push(
+    `[MEDIUM] ${name}: <radiusoffset method="${method}"> is not a known RadiusMethod — ` +
+      `treated as "${fallback}".`
+  );
+  return fallback;
+}
+
+function parsePosition(
+  el: Record<string, unknown>,
+  type: ComponentType,
+  warnings: string[],
+  name: string
+): Position {
   // Axial position: <axialoffset method="bottom">0.1219</axialoffset>
   // Also <position type="bottom">0.1219</position> (redundant in newer files)
   const axial = valWithMethod(el['axialoffset'] as Record<string, unknown>);
@@ -192,63 +237,268 @@ function parsePosition(el: Record<string, unknown>): Position {
   const angle = valWithMethod(el['angleoffset'] as Record<string, unknown>);
   const rotation = valWithMethod(el['rotation'] as Record<string, unknown>);
 
-  const axialMethod = (axial.method || 'after') as AxialMethod;
-  const radiusMethod = (radius.method || 'coaxial') as RadiusMethod;
-  const angleMethod = (angle.method || 'relative') as AngleMethod;
+  // OpenRocket ComponentAssembly defaults differ from ordinary components.
+  // Pod sets and parallel stages are off-axis, two-instance assemblies whose
+  // fore ends default to the parent's aft (BOTTOM) end. Axial stages remain on
+  // the centreline and are implicitly positioned AFTER the preceding stage.
+  const isRingAssembly = type === 'podset' || type === 'parallelstage';
+  const axialMethod = (axial.method || (isRingAssembly ? 'bottom' : 'after')) as AxialMethod;
+  const angleMethod = parseAngleMethod(angle.method, warnings, name);
+  const radiusMethod = parseRadiusMethod(
+    radius.method,
+    isRingAssembly,
+    warnings,
+    name
+  );
 
   // The `rotation` element is the true base rotation for fin sets; `angleoffset`
   // is the position of the component around the body axis. For line-instanced
   // components both represent the same rotation offset. Use angleoffset if present.
   const angleDeg = angle.method !== '' ? angle.value : rotation.value;
 
+  // `<radialdirection>` is the legacy (OpenRocket 15.03-era) spelling of the
+  // same angle.  RocketComponentSaver writes it from the identical value it
+  // writes into `<angleoffset>` for components that are neither fin sets,
+  // parallel stages, pod sets, nor rail buttons -- so a current file carries
+  // both.  They are one angle, not two: reading both and applying both rotates
+  // the component twice (a 180 degree launch lug ends up back at 0).  Only
+  // fall back to `<radialdirection>` when the modern elements are absent.
+  const hasModernAngle = el['angleoffset'] !== undefined || el['rotation'] !== undefined;
+
   return {
     axialMethod,
     axialOffset: axial.value,
     position: [0, 0, 0], // absolute [x,y,z] computed later in geometry pass
-    instanceCount: Math.max(1, num(el, 'instancecount', 1)),
+    instanceCount: Math.max(1, num(el, 'instancecount', isRingAssembly ? 2 : 1)),
     instanceSeparation: num(el, 'instanceseparation'),
     angleOffset: angleDeg * (Math.PI / 180), // stored in degrees
     angleMethod,
     radiusOffset: radius.value,
     radiusMethod,
+    // Radial displacement (magnitude in meters, direction degrees in the XML,
+    // converted to radians here). Defaults to coaxial (0).
+    radialPosition: num(el, 'radialposition'),
+    radialDirection: hasModernAngle ? 0 : parseNum(el['radialdirection'], 0) * (Math.PI / 180),
+  };
+}
+
+// ---------- Appearance / color parsing ----------
+
+/**
+ * Extract the component's color from its <appearance> block:
+ *   <appearance><paint red="255" green="102" blue="0" alpha="0"/></appearance>
+ * Returns an RGBA object with each channel between 0 and 1 (inclusive),
+ * matching the Onshape `Color` API, or undefined if no paint is defined.
+ */
+function parseAppearanceColor(
+  el: Record<string, unknown>
+): RocketComponent['color'] | undefined {
+  const appearance = el['appearance'] as Record<string, unknown> | undefined;
+  if (!appearance || typeof appearance !== 'object') return undefined;
+  const paint = appearance['paint'] as Record<string, unknown> | undefined;
+  if (!paint || typeof paint !== 'object') return undefined;
+  const channel = (v: unknown) =>
+    Math.min(1, Math.max(0, parseNum(v, 0) / 255));
+  return {
+    red: channel(paint['@_red']),
+    green: channel(paint['@_green']),
+    blue: channel(paint['@_blue']),
+    // Alpha in .ork files is on the same 0-255 scale as the color channels
+    alpha: Math.min(1, Math.max(0, parseNum(paint['@_alpha'], 255) / 255)),
   };
 }
 
 // ---------- Component parsing ----------
 
-function parseSymmetricParams(el: Record<string, unknown>): SymmetricParams {
+/**
+ * The `relativeto` values that only the MODERN (2021+) fin-tab spelling uses.
+ * A current-format file writes two <tabposition> elements -- the legacy
+ * front/center/end one first, the modern one second -- so when both are
+ * present the modern entry is the one to read, and these three keywords are
+ * how it is identified.  See FinSetSaver.java and parseFinCommon.
+ */
+// AxialMethod's five values, as FinSetSaver writes them (the enum name, lowercased).
+// The legacy front/center/end spellings are also written, for files predating the
+// modern vocabulary, and are mapped onto the modern ones.  'absolute' and 'after'
+// used to be folded into 'middle' here, which silently put the tab in the wrong
+// place -- see the note on FinTabPositionMethod in types.ts.
+const MODERN_TAB_METHODS = new Set([
+  'top',
+  'middle',
+  'bottom',
+  'absolute',
+  'after',
+]);
+
+const TAB_METHOD_ALIASES: Record<string, FinTabPositionMethod> = {
+  top: 'top',
+  front: 'top',
+  middle: 'middle',
+  center: 'middle',
+  centre: 'middle',
+  bottom: 'bottom',
+  end: 'bottom',
+  absolute: 'absolute',
+  tip: 'absolute',
+  after: 'after',
+  aftersibling: 'after',
+  aftersiblings: 'after',
+};
+
+/**
+ * Parse the symmetric-body parameters shared by nose cones and transitions.
+ *
+ * NOSE CONE FLIP (tail cone)
+ * -------------------------
+ * `<isflipped>` turns a nose cone into a tail cone, and it is subtle because
+ * OpenRocket does NOT mirror the stored numbers. `NoseConeSaver` writes the
+ * cone's BASE radius into `<aftradius>` and its BASE shoulder into
+ * `<aftshoulder*>` -- both via the flip-independent `getBaseRadius()` /
+ * `getShoulderRadius()` / `getShoulderLength()` / `getShoulderThickness()` /
+ * `isShoulderCapped()` accessors -- and it never writes `<foreradius>` or
+ * `<foreshoulder*>` at all (`DocumentConfig` explicitly disables those setters
+ * for nose cones). So a tail cone arrives here byte-for-byte identical to a
+ * normal nose cone, and `<isflipped>` is the ONLY evidence of the flip.
+ *
+ * `NoseCone.setFlipped(true)` gives the meaning of the flag: the base moves to
+ * the fore end and the tip is reset to a point at the aft end
+ * (`resetAftRadius()`), and the shoulders move with it. This function performs
+ * exactly that swap, ONCE, at the point where the file format is known, so that
+ * every downstream consumer -- `symmetricProfile`, `shoulderProfile`, the
+ * auto-radius resolution pass, mass estimation and fin mounting -- can treat a
+ * tail cone as an ordinary symmetric body with its true fore/aft radii and needs
+ * no notion of "flip" at all.
+ *
+ * The `flipped` flag itself is still recorded on the params, both to round-trip
+ * the file faithfully and so consumers can label the component a tail cone.
+ */
+function parseSymmetricParams(el: Record<string, unknown>, isNoseCone = false): SymmetricParams {
   const shape = (str(el, 'shape') || 'conical') as SymmetricShape;
   const thicknessRaw = str(el, 'thickness');
   const filled = isFilled(thicknessRaw);
+
+  // `<isflipped>` is a nose-cone-only element; a transition never carries one.
+  const flipped = isNoseCone && bool(el, 'isflipped');
+
+  // As stored: the `<aft*>` elements hold the cone's BASE end, flip-independent.
+  const storedForeRadius = num(el, 'foreradius');
+  const storedAftRadius = num(el, 'aftradius');
+  const storedForeShoulder: Shoulder = {
+    radius: num(el, 'foreshoulderradius'),
+    length: num(el, 'foreshoulderlength'),
+    thickness: num(el, 'foreshoulderthickness'),
+    capped: bool(el, 'foreshouldercapped'),
+  };
+  const storedAftShoulder: Shoulder = {
+    radius: num(el, 'aftshoulderradius'),
+    length: num(el, 'aftshoulderlength'),
+    thickness: num(el, 'aftshoulderthickness'),
+    capped: bool(el, 'aftshouldercapped'),
+  };
+  const storedBaseAuto = isAuto(el['aftradius']);
+  const storedForeAuto = isAuto(el['foreradius']);
+
+  // A tail cone is a base-at-the-fore body tapering to a point at the aft end,
+  // so the ends swap and the aft (tip) end carries no auto flag or shoulder.
+  const foreRadius = flipped ? storedAftRadius : storedForeRadius;
+  const aftRadius = flipped ? 0 : storedAftRadius;
+  const shoulderFore = flipped ? storedAftShoulder : storedForeShoulder;
+  const shoulderAft = flipped
+    ? { radius: 0, length: 0, thickness: 0, capped: false }
+    : storedAftShoulder;
+  // The auto marker travels with the base, so on a tail cone it is a FORE auto.
+  const baseRadiusAutomatic = flipped ? storedForeAuto : storedBaseAuto;
+  const foreRadiusAutomatic = flipped ? storedBaseAuto : storedForeAuto;
 
   return {
     shape,
     shapeParameter: num(el, 'shapeparameter', 1),
     shapeClipped: bool(el, 'shapeclipped'),
     length: num(el, 'length'),
-    foreRadius: num(el, 'foreradius'),
-    aftRadius: num(el, 'aftradius'),
+    foreRadius,
+    aftRadius,
     thickness: filled ? -1 : parseNum(thicknessRaw, 0),
     filled,
-    shoulderFore: {
-      radius: num(el, 'foreshoulderradius'),
-      length: num(el, 'foreshoulderlength'),
-      thickness: num(el, 'foreshoulderthickness'),
-      capped: bool(el, 'foreshouldercapped'),
-    },
-    shoulderAft: {
-      radius: num(el, 'aftshoulderradius'),
-      length: num(el, 'aftshoulderlength'),
-      thickness: num(el, 'aftshoulderthickness'),
-      capped: bool(el, 'aftshouldercapped'),
-    },
-    flipped: bool(el, 'isflipped'),
-    baseRadiusAutomatic: isAuto(el['aftradius']),
-    foreRadiusAutomatic: isAuto(el['foreradius']),
+    shoulderFore,
+    shoulderAft,
+    flipped,
+    baseRadiusAutomatic,
+    foreRadiusAutomatic,
   };
 }
 
-function parseBodyTubeParams(el: Record<string, unknown>): BodyTubeParams {
+/**
+ * The `configid` of the rocket's DEFAULT motor configuration.
+ *
+ * A `<motormount>` holds one `<motor>` per flight configuration, each tagged
+ * with the `configid` it belongs to, and the rocket-level
+ * `<motorconfiguration configid="..." default="true">` names which of those
+ * configurations the designer considers the default one. That mapping is what
+ * says WHICH motor is actually loaded — `motors[0]` is only the first one
+ * written, which is document order and nothing more.
+ *
+ * They differ on 4 of the 7 test rockets: `demon 54.ork` opens with H250G but
+ * its default configuration is I200W; `Antar` opens with C6, default D20W;
+ * `Bell X-1` D12 vs E12; `ExamplePods` A8 vs C6. Taking `motors[0]` therefore
+ * drew the wrong motor on more than half the corpus.
+ *
+ * Returns '' when the file declares no default, in which case the caller falls
+ * back to the first motor rather than to no motor at all.
+ */
+function defaultMotorConfigId(rocketEl: Record<string, unknown>): string {
+  const configs = toArray<Record<string, unknown>>(
+    rocketEl['motorconfiguration'] as Record<string, unknown> | Record<string, unknown>[] | undefined
+  );
+  for (const cfg of configs) {
+    if (parseBool(cfg['@_default'], false)) return attr(cfg, 'configid');
+  }
+  return '';
+}
+
+/**
+ * Resolve one `<motormount>`: the motor belonging to the default configuration,
+ * plus the full candidate list so a caller can see what else was on offer.
+ *
+ * Falls back to the first motor when the default configuration loads nothing
+ * into this mount — a booster that is parked in some configurations but loaded
+ * in the default one is the normal case for a two-stage rocket, and dropping the
+ * motor entirely there would delete a motor the file clearly defines.
+ */
+function parseMotorMount(
+  mm: Record<string, unknown>,
+  defaultConfigId: string
+): MotorMountParams {
+  const motors = toArray<Record<string, unknown>>(
+    mm['motor'] as Record<string, unknown> | Record<string, unknown>[] | undefined
+  );
+
+  const candidates: MotorConfiguration[] = motors.map((motor) => ({
+    configId: attr(motor, 'configid'),
+    designation: str(motor, 'designation'),
+    manufacturer: str(motor, 'manufacturer'),
+    digest: str(motor, 'digest'),
+    diameter: num(motor, 'diameter'),
+    length: num(motor, 'length'),
+  }));
+
+  const selected =
+    candidates.find((c) => defaultConfigId !== '' && c.configId === defaultConfigId) ??
+    candidates[0];
+
+  return {
+    overhang: num(mm, 'overhang'),
+    designation: selected?.designation ?? '',
+    manufacturer: selected?.manufacturer ?? '',
+    digest: selected?.digest ?? '',
+    diameter: selected?.diameter ?? 0,
+    length: selected?.length ?? 0,
+    ignitionDelay: num(mm, 'ignitiondelay'),
+    configurationCount: motors.length,
+    ...(candidates.length > 0 ? { configurations: candidates } : {}),
+  };
+}
+
+function parseBodyTubeParams(el: Record<string, unknown>, defaultConfigId: string): BodyTubeParams {
   const thicknessRaw = str(el, 'thickness');
   const filled = isFilled(thicknessRaw);
 
@@ -259,17 +509,7 @@ function parseBodyTubeParams(el: Record<string, unknown>): BodyTubeParams {
   let motorMount: BodyTubeParams['motorMount'];
   if (el['motormount']) {
     const mm = el['motormount'] as Record<string, unknown>;
-    const motors = toArray<Record<string, unknown>>(
-      (mm['motor'] as Record<string, unknown> | Record<string, unknown>[] | undefined)
-    );
-    const motor = motors[0];
-    motorMount = {
-      overhang: num(mm, 'overhang'),
-      designation: motor ? str(motor, 'designation') : '',
-      diameter: motor ? num(motor, 'diameter') : 0,
-      length: motor ? num(motor, 'length') : 0,
-      ignitionDelay: num(mm, 'ignitiondelay'),
-    };
+    motorMount = parseMotorMount(mm, defaultConfigId);
   }
 
   return {
@@ -290,22 +530,33 @@ function parseFinCommon(el: Record<string, unknown>): {
   crossSection: FinCrossSection;
   cantAngle: number;
   baseRotation: number;
-  tab: { height: number; length: number; position: number; positionMethod: 'top' | 'bottom' | 'middle' };
+  tab: { height: number; length: number; position: number; positionMethod: FinTabPositionMethod };
   filletRadius: number;
   filletMaterial?: Material;
 } {
   const crossSection = (str(el, 'crosssection') || 'square') as FinCrossSection;
 
-  // Tab position: <tabposition relativeto="center">0.01016</tabposition>
-  const tabPos = el['tabposition'] as Record<string, unknown> | undefined;
+  // Tab position.  OpenRocket's FinSetSaver writes the SAME offset TWICE for
+  // backward compatibility: once with the legacy `relativeto` vocabulary
+  // (front/center/end) and once with the modern one (top/middle/bottom) -- see
+  // FinSetSaver.java.  A current-format file therefore carries two sibling
+  // <tabposition> elements, fast-xml-parser hands both back as an array, and
+  // `attr()` on an array yields ''.  Reading it as a single object is what made
+  // every tab silently fall back to `middle` at position 0.
+  //
+  // So: take the array, and prefer the entry whose `relativeto` is a MODERN
+  // keyword.  The legacy spelling is only a fallback, for pre-2021 files that
+  // write just the one element.
+  const tabEntries = toArray<Record<string, unknown>>(el['tabposition'] as Record<string, unknown> | Record<string, unknown>[] | undefined);
+  const modernEntry = tabEntries.find((e) => MODERN_TAB_METHODS.has(attr(e, 'relativeto').toLowerCase()));
+  const tabPos = modernEntry ?? tabEntries[0];
   let tabPosition = 0;
-  let tabPositionMethod: 'top' | 'bottom' | 'middle' = 'middle';
+  let tabPositionMethod: FinTabPositionMethod = 'middle';
   if (tabPos) {
-    const rel = attr(tabPos, 'relativeto').toLowerCase();
-    // Newer files also emit a method-style attribute; map to enum
-    if (rel === 'front' || rel === 'top') tabPositionMethod = 'top';
-    else if (rel === 'end' || rel === 'bottom') tabPositionMethod = 'bottom';
-    else tabPositionMethod = 'middle';
+    // A modern file may also spell it as a `method` attribute; `relativeto` is
+    // what the saver actually writes, so it is checked first.
+    const rel = (attr(tabPos, 'relativeto') || attr(tabPos, 'method')).toLowerCase();
+    tabPositionMethod = TAB_METHOD_ALIASES[rel] ?? 'middle';
     tabPosition = parseNum(tabPos['#text'] ?? tabPos['value'], 0);
   }
 
@@ -362,12 +613,15 @@ function parseFreeformFinParams(el: Record<string, unknown>): FreeformFinParams 
 }
 
 function parseTubeFinParams(el: Record<string, unknown>): TubeFinParams {
+  const radiusValue = el['radius'] ?? el['outerradius'];
+  const outerRadiusAutomatic = isAuto(radiusValue);
   return {
     finCount: Math.max(1, num(el, 'fincount', 1)),
     length: num(el, 'length'),
-    outerRadius: parseNum(el['radius'] ?? el['outerradius'], 0),
+    outerRadius: outerRadiusAutomatic ? 0 : parseNum(radiusValue, 0),
     thickness: num(el, 'thickness'),
     baseRotation: parseNum(el['rotation'], 0) * (Math.PI / 180),
+    ...(outerRadiusAutomatic ? { autoOuterRadius: true as const } : {}),
   };
 }
 
@@ -393,33 +647,28 @@ function parseRailButtonParams(el: Record<string, unknown>): RailButtonParams {
   };
 }
 
-function parseRingComponentParams(el: Record<string, unknown>): RingComponentParams {
+function parseRingComponentParams(
+  el: Record<string, unknown>,
+  defaultConfigId: string
+): RingComponentParams {
   let motorMount: RingComponentParams['motorMount'];
   if (el['motormount']) {
-    const mm = el['motormount'] as Record<string, unknown>;
-    const motors = toArray<Record<string, unknown>>(
-      (mm['motor'] as Record<string, unknown> | Record<string, unknown>[] | undefined)
-    );
-    const motor = motors[0];
-    motorMount = {
-      overhang: num(mm, 'overhang'),
-      designation: motor ? str(motor, 'designation') : '',
-      diameter: motor ? num(motor, 'diameter') : 0,
-      length: motor ? num(motor, 'length') : 0,
-      ignitionDelay: num(mm, 'ignitiondelay'),
-    };
+    motorMount = parseMotorMount(el['motormount'] as Record<string, unknown>, defaultConfigId);
   }
 
+  const outerRadiusAuto = isAuto(el['outerradius']);
+  const innerRadiusAuto = isAuto(el['innerradius']);
+
   return {
-    outerRadius: num(el, 'outerradius'),
-    innerRadius: num(el, 'innerradius'),
+    outerRadius: outerRadiusAuto ? 0 : num(el, 'outerradius'),
+    innerRadius: innerRadiusAuto ? 0 : num(el, 'innerradius'),
+    ...(outerRadiusAuto ? { autoOuterRadius: true as const } : {}),
+    ...(innerRadiusAuto ? { autoInnerRadius: true as const } : {}),
     thickness: num(el, 'thickness'),
     length: num(el, 'length'),
     clusterConfiguration: str(el, 'clusterconfiguration') || 'single',
     clusterScale: num(el, 'clusterscale', 1),
     clusterRotation: num(el, 'clusterrotation'),
-    radialPosition: num(el, 'radialposition'),
-    radialDirection: parseNum(el['radialdirection'], 0) * (Math.PI / 180),
     isMotorMount: el['motormount'] !== undefined,
     motorMount,
   };
@@ -429,14 +678,25 @@ function parseRecoveryParams(el: Record<string, unknown>): RecoveryDeviceParams 
   return {
     packedLength: num(el, 'packedlength'),
     packedRadius: num(el, 'packedradius'),
-    radialPosition: num(el, 'radialposition'),
-    radialDirection: parseNum(el['radialdirection'], 0) * (Math.PI / 180),
     material: parseMaterial(el['material'] as Record<string, unknown> | undefined),
     diameter: num(el, 'diameter'),
     stripLength: num(el, 'striplength'),
     stripWidth: num(el, 'stripwidth'),
     cordLength: num(el, 'cordlength'),
-    mass: num(el, 'mass'),
+    // An absent mass is meaningful: it means the component has no explicit
+    // mass override. Do not turn it into zero, which would be a false warning.
+    ...(el['mass'] === undefined ? {} : { mass: num(el, 'mass') }),
+  };
+}
+
+function parseAssemblyParams(el: Record<string, unknown>, type: ComponentType) {
+  if (type !== 'parallelstage') return {};
+  return {
+    separation: {
+      event: str(el, 'separationevent') || undefined,
+      altitude: el['separationaltitude'] === undefined ? undefined : num(el, 'separationaltitude'),
+      delay: el['separationdelay'] === undefined ? undefined : num(el, 'separationdelay'),
+    },
   };
 }
 
@@ -563,18 +823,22 @@ function parseComponent(
   el: Record<string, unknown>,
   warnings: string[],
   type: ComponentType,
-  order: OrderLevel = EMPTY_ORDER
+  order: OrderLevel = EMPTY_ORDER,
+  defaultConfigId = ''
 ): RocketComponent {
   const material = parseMaterial(el['material'] as Record<string, unknown> | undefined);
 
   let params: RocketComponent['params'];
   switch (type) {
     case 'nosecone':
+      // Only a nose cone can be flipped into a tail cone (`<isflipped>`).
+      params = parseSymmetricParams(el, true);
+      break;
     case 'transition':
       params = parseSymmetricParams(el);
       break;
     case 'bodytube':
-      params = parseBodyTubeParams(el);
+      params = parseBodyTubeParams(el, defaultConfigId);
       break;
     case 'trapezoidfinset':
       params = parseTrapezoidFinParams(el);
@@ -599,7 +863,7 @@ function parseComponent(
     case 'centeringring':
     case 'bulkhead':
     case 'engineblock':
-      params = parseRingComponentParams(el);
+      params = parseRingComponentParams(el, defaultConfigId);
       break;
     case 'parachute':
     case 'streamer':
@@ -607,25 +871,34 @@ function parseComponent(
     case 'masscomponent':
       params = parseRecoveryParams(el);
       break;
+    case 'stage':
+    case 'podset':
+    case 'parallelstage':
+      params = parseAssemblyParams(el, type);
+      break;
     default:
       params = {} as RocketComponent['params'];
   }
 
+  const name = str(el, 'name') || type;
+
   return {
     type,
-    name: str(el, 'name') || type,
+    name,
     id: str(el, 'id'),
     material,
-    position: parsePosition(el),
+    color: parseAppearanceColor(el) ?? guessMaterialColor(material),
+    position: parsePosition(el, type, warnings, name),
     params,
-    children: parseChildren(el, warnings, order),
+    children: parseChildren(el, warnings, order, defaultConfigId),
   };
 }
 
 function parseChildren(
   el: Record<string, unknown>,
   warnings: string[],
-  order: OrderLevel = EMPTY_ORDER
+  order: OrderLevel = EMPTY_ORDER,
+  defaultConfigId = ''
 ): RocketComponent[] {
   const sub = el['subcomponents'];
   if (sub === undefined || typeof sub !== 'object') return [];
@@ -643,7 +916,7 @@ function parseChildren(
     if (tag === '@_type') continue;
     const type = COMPONENT_TAGS[tag] ?? (tag === 'stage' ? 'stage' : null);
     if (!type) {
-      warnings.push(`Unknown component tag: <${tag}> — skipped`);
+      warnings.push(`[MEDIUM] Unknown or unsupported component tag: <${tag}> — skipped`);
       continue;
     }
     const occurrence = consumed[tag] ?? 0;
@@ -655,18 +928,154 @@ function parseChildren(
       value as Record<string, unknown> | Record<string, unknown>[]
     )[occurrence];
     if (typeof c === 'object') {
-      components.push(parseComponent(c, warnings, type, order.children[i]));
+      components.push(
+        parseComponent(c, warnings, type, order.children[i], defaultConfigId)
+      );
     }
   }
   return components;
 }
 
+// ---------- Center of pressure ----------
+
+/** Median of a non-empty numeric array; mean of the two middles when even. */
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/**
+ * Below this Mach the rocket is coasting past apogee rather than flying, and
+ * OpenRocket's own `SymmetricComponentCalc.getLiftCP` applies a `mul` correction
+ * for `Mach < 0.05 && AOA > 45 deg` with the comment "This causes an anomaly to
+ * the flight results with the CP jumping at apogee". So the same samples are
+ * noise for us. On `ExamplePods-airframe and winglets.ork` the raw column
+ * bottoms out at 0.316 m at t=2.85 s, AOA=41 deg, Mach=0.008; drop that regime
+ * and the column tightens to 0.336-0.342.
+ */
+const CP_MIN_MACH = 0.05;
+
+/**
+ * Collect every usable `CP location` sample from every saved flight-data
+ * branch, one entry per branch and in flight order.
+ *
+ * A sample is usable when the column parses to a finite number STRICTLY
+ * GREATER THAN ZERO. OpenRocket packs three unusable regions into that one
+ * column, all of them visible in `ExamplePods-airframe and winglets.ork`:
+ *
+ *  1. `NaN` for every row before the rocket clears the launch rod (48 leading
+ *     rows there).
+ *  2. An exact `0` for every row after the simulation has finished and the
+ *     rocket has landed. That is a "no forces" sentinel, not a measurement —
+ *     a `cp >= 0` guard would accept it and park the marker on the nose tip.
+ *  3. A low-reading launch transient in the first real row: that file's column
+ *     opens at 0.334 and then sits at 0.342 for the rest of the flight.
+ *
+ * The post-apogee rows are then dropped by Mach (see `CP_MIN_MACH`), unless
+ * that would leave the branch with nothing at all — a slow glider may never
+ * exceed the threshold, and "no CP" is a worse answer than a noisy one.
+ */
+function collectCenterOfPressure(
+  rocketEl: Record<string, unknown>,
+  rootEl?: Record<string, unknown>
+): CenterOfPressureBranch[] {
+  // Current OpenRocket files store <simulations> as a sibling of <rocket>;
+  // some exporters/older synthetic files place it inside <rocket>.
+  const simulationsEl = (rocketEl['simulations'] ?? rootEl?.['simulations']) as Record<string, unknown> | undefined;
+  const simulations = toArray<Record<string, unknown>>(simulationsEl?.['simulation'] as Record<string, unknown> | Record<string, unknown>[] | undefined);
+  const branches: CenterOfPressureBranch[] = [];
+
+  for (const simulation of simulations) {
+    const simulationName = str(simulation, 'name');
+    const flightData = simulation['flightdata'] as Record<string, unknown> | undefined;
+    const rawBranches = toArray<Record<string, unknown>>(flightData?.['databranch'] as Record<string, unknown> | Record<string, unknown>[] | undefined);
+    for (const branch of rawBranches) {
+      const types = String(branch['@_types'] ?? branch['types'] ?? '').split(',');
+      const cpIndex = types.findIndex((type) => type.trim() === 'CP location');
+      if (cpIndex < 0) continue;
+      const machIndex = types.findIndex((type) => type.trim() === 'Mach number');
+      const points = toArray<string | Record<string, unknown>>(branch['datapoint'] as string | Record<string, unknown> | (string | Record<string, unknown>)[] | undefined);
+
+      const usable: Array<{ cp: number; mach: number }> = [];
+      for (const point of points) {
+        const columns = textValue(point).split(',');
+        const cp = parseNum(columns[cpIndex], Number.NaN);
+        // `> 0`, not `>= 0`: the post-flight sentinel is a literal zero.
+        if (!Number.isFinite(cp) || cp <= 0) continue;
+        const mach = machIndex >= 0 ? parseNum(columns[machIndex], Number.NaN) : Number.NaN;
+        usable.push({ cp, mach });
+      }
+      if (usable.length === 0) continue;
+
+      const flying = usable.filter((s) => Number.isFinite(s.mach) && s.mach >= CP_MIN_MACH);
+      const kept = flying.length > 0 ? flying : usable;
+      const values = kept.map((s) => s.cp);
+
+      branches.push({
+        simulation: simulationName,
+        branch: attr(branch, 'name'),
+        count: values.length,
+        first: values[0],
+        median: median(values),
+        min: Math.min(...values),
+        max: Math.max(...values),
+        machFiltered: flying.length > 0,
+        apogeeSamples: usable.length - kept.length,
+        values,
+      });
+    }
+  }
+
+  return branches;
+}
+
+/**
+ * The single CP the Onshape feature draws: the MEDIAN of the selected branch
+ * (the first one unless the caller picks another). Median rather than first row
+ * because the first row is the launch transient, which reads low (0.334 vs the
+ * settled 0.342 on `ExamplePods-airframe and winglets.ork` — an 8 mm error in
+ * the marker).
+ *
+ * Note this is a *simulated* CP from one saved flight, NOT the static CP that
+ * OpenRocket's design view draws. The design view is the worst case over 360
+ * roll angles at M = 0.3 and alpha = 0; for the pods/winglets rocket that is
+ * ~0.301 m against the ~0.340 m this returns, a systematic ~39 mm gap. See
+ * local/feature-support-audit.md section 3.9a.
+ */
+function parseCenterOfPressure(
+  rocketEl: Record<string, unknown>,
+  rootEl?: Record<string, unknown>,
+  branchIndex = 0
+): { centerOfPressure?: number; centerOfPressureSource?: number; centerOfPressureBranches: CenterOfPressureBranch[] } {
+  const branches = collectCenterOfPressure(rocketEl, rootEl);
+  if (branches.length === 0) {
+    return { centerOfPressureBranches: branches };
+  }
+  const selected = branches[Math.min(Math.max(branchIndex, 0), branches.length - 1)];
+  return {
+    centerOfPressure: selected.median,
+    centerOfPressureSource: branches.indexOf(selected),
+    centerOfPressureBranches: branches,
+  };
+}
+
 // ---------- Main entry point ----------
+
+export interface ParseOrkOptions {
+  /**
+   * Which saved flight-data branch to take the center of pressure from, as an
+   * index into `rocket.centerOfPressureBranches`. The UI exposes this so the
+   * user can pick a simulation; out-of-range values clamp to the last branch.
+   * Defaults to the first branch that carries usable data.
+   */
+  centerOfPressureBranch?: number;
+}
 
 /**
  * Parse an .ork file (as ArrayBuffer) into a RocketJson structure.
  */
-export async function parseOrkFile(buffer: ArrayBuffer): Promise<RocketJson> {
+export async function parseOrkFile(buffer: ArrayBuffer, options: ParseOrkOptions = {}): Promise<RocketJson> {
   const warnings: string[] = [];
 
   // 1. Unzip the .ork archive
@@ -676,8 +1085,6 @@ export async function parseOrkFile(buffer: ArrayBuffer): Promise<RocketJson> {
     throw new Error('Invalid .ork file: missing rocket.ork entry');
   }
   const xmlText = await rocketFile.async('string');
-
-  console.log(xmlText);
 
   // 2. Parse the XML
   const parsed = xmlParser.parse(xmlText);
@@ -704,7 +1111,13 @@ export async function parseOrkFile(buffer: ArrayBuffer): Promise<RocketJson> {
   warnings.push(`OpenRocket file format version: ${version}`);
 
   // 3. Build the RocketJson
-  const components = parseChildren(rocketEl, warnings, rocketOrder);
+  // The default motor configuration is resolved ONCE, at the rocket level, and
+  // handed down: it is a property of the rocket, not of any one mount, and every
+  // mount has to be resolved against the same one.
+  const defaultMotorConfig = defaultMotorConfigId(rocketEl);
+  const components = parseChildren(rocketEl, warnings, rocketOrder, defaultMotorConfig);
+  const { centerOfPressure, centerOfPressureSource, centerOfPressureBranches } =
+    parseCenterOfPressure(rocketEl, root, options.centerOfPressureBranch);
 
   const rocket: Rocket = {
     name: str(rocketEl, 'name') || 'Unnamed Rocket',
@@ -716,11 +1129,20 @@ export async function parseOrkFile(buffer: ArrayBuffer): Promise<RocketJson> {
     referenceLength: num(rocketEl, 'customreference'),
     unitSystem: 'SI',
     components,
+    ...(centerOfPressure !== undefined ? { centerOfPressure } : {}),
+    ...(centerOfPressureSource !== undefined ? { centerOfPressureSource } : {}),
+    // Diagnostic only; the FeatureScript reads `centerOfPressure`, never this.
+    ...(centerOfPressureBranches.length > 0 ? { centerOfPressureBranches } : {}),
   };
 
   return {
-    schemaVersion: '1.0',
+    // Keep in step with EXPECTED_SCHEMA_VERSION in osFeature/main.fs.  1.2: the
+    // meridian section (profile/innerProfile) is the body ALONE; shoulders moved
+    // to their own `shoulderProfile.fore`/`.aft` polygons, each revolved
+    // separately and boolean-unioned on by the FeatureScript.
+    schemaVersion: '1.2',
     rocket,
     warnings,
+    warningDetails: [],
   };
 }

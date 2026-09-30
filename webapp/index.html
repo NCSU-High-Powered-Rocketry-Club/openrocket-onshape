@@ -6,41 +6,43 @@
   <title>OpenRocket → Onshape Converter</title>
   <style>
     :root {
-      --bg: #1e1e2e;
-      --panel: #2a2a3d;
-      --border: #3a3a55;
-      --text: #e0e0f0;
-      --muted: #9a9ab0;
-      --accent: #7f9cf5;
-      --success: #6ee7b7;
-      --error: #f87171;
+      --bg: #eef1f3;
+      --panel: #ffffff;
+      --panel-alt: #f5f7f8;
+      --border: #c5cdd2;
+      --border-strong: #8e9aa2;
+      --text: #17232d;
+      --muted: #5c6b73;
+      --openrocket: #36434b;
+      --onshape: #1479b8;
+      --onshape-green: #2e8b57;
+      --success: #197a4b;
+      --warning: #9a6700;
+      --high: #c2410c;
+      --error: #b42318;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: var(--bg);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background-color: var(--bg);
+      background-image: linear-gradient(rgba(20, 121, 184, .045) 1px, transparent 1px), linear-gradient(90deg, rgba(20, 121, 184, .045) 1px, transparent 1px);
+      background-size: 24px 24px;
       color: var(--text);
       min-height: 100vh;
     }
     header {
       padding: 1rem 2rem;
-      background: linear-gradient(135deg, #2c2c44, #20203a);
-      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+      border-bottom: 2px solid var(--border-strong);
+      border-top: 4px solid var(--onshape-green);
+      box-shadow: 0 2px 0 rgba(23, 35, 45, .08);
       display: flex;
       align-items: center;
       gap: 1rem;
     }
-    header h1 { font-size: 1.25rem; margin: 0; font-weight: 600; }
-    header .badge {
-      background: var(--accent);
-      color: #fff;
-      padding: 0.15rem 0.6rem;
-      border-radius: 999px;
-      font-size: 0.7rem;
-      font-weight: 600;
-      letter-spacing: 0.04em;
-    }
+    header h1 { font-size: 1.25rem; margin: 0; font-weight: 700; letter-spacing: -.02em; }
+    header h1 span { color: #36434b; }
     main {
       max-width: 1100px;
       margin: 0 auto;
@@ -52,17 +54,19 @@
     .card {
       background: var(--panel);
       border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 1.5rem 2rem;
+      border-top: 3px solid var(--onshape);
+      border-radius: 4px;
+      padding: 1.35rem 1.5rem;
+      box-shadow: 0 1px 2px rgba(23, 35, 45, .06);
     }
-    .card h2 { margin: 0 0 0.75rem; font-size: 1.1rem; }
-    .card p { margin: 0.25rem 0 0.75rem; color: var(--muted); font-size: 0.9rem; }
+    .card h2 { margin: 0 0 .6rem; font-size: 1.05rem; color: #263746; letter-spacing: .01em; }
+    .card p { margin: .2rem 0 .8rem; color: var(--muted); font-size: .9rem; }
     .row { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
     button {
-      background: var(--accent);
+      background: var(--onshape);
       color: #fff;
-      border: none;
-      border-radius: 6px;
+      border: 1px solid #0d5c8d;
+      border-radius: 3px;
       padding: 0.55rem 1.25rem;
       font-size: 0.95rem;
       cursor: pointer;
@@ -71,34 +75,37 @@
     }
     button:hover { opacity: 0.85; }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
-    button.secondary { background: #4a4a6a; }
+    button.secondary { background: var(--panel-alt); color: var(--text); border: 1px solid var(--border-strong); }
     input[type="file"] {
       background: transparent;
       color: var(--muted);
       flex: 1;
     }
     .drop {
-      border: 2px dashed var(--border);
-      border-radius: 8px;
-      padding: 2.5rem;
+      border: 2px dashed var(--border-strong);
+      border-radius: 3px;
+      padding: 3rem 2rem;
       text-align: center;
       color: var(--muted);
       cursor: pointer;
-      transition: border-color 0.15s;
+      transition: border-color .15s, background .15s, transform .15s;
     }
-    .drop:hover { border-color: var(--accent); }
+    .drop:hover, .drop.dragging { border-color: var(--onshape); background: rgba(20, 121, 184, .07); transform: translateY(-1px); }
     .drop b { color: var(--text); }
     code, pre {
       font-family: "SFMono-Regular", Consolas, monospace;
     }
     pre {
-      background: #18182b;
-      border: 1px solid var(--border);
-      border-radius: 6px;
+      background: #f7f9fa;
+      color: #1f2d36;
+      border: 1px solid var(--border-strong);
+      border-radius: 3px;
       padding: 1rem;
       overflow: auto;
-      max-height: 400px;
-      font-size: 0.8rem;
+      max-height: 440px;
+      font-size: .82rem;
+      line-height: 1.55;
+      tab-size: 2;
       white-space: pre;
     }
     .status { font-size: 0.9rem; }
@@ -110,26 +117,47 @@
       gap: 0.5rem;
       margin-top: 0.5rem;
     }
-    #summaryGrid div {
-      background: #18182b;
-      padding: 0.75rem;
-      border-radius: 6px;
+    .output-actions { margin-top: 1rem; }
+    .checkbox-label { display: inline-flex; align-items: center; gap: .55rem; color: var(--muted); font-size: .88rem; cursor: pointer; }
+    .checkbox-label input { width: 1rem; height: 1rem; accent-color: var(--onshape); }
+    #summaryGrid div { background: var(--panel-alt);
+      padding: .75rem;
+      border-radius: 3px;
       border: 1px solid var(--border);
     }
-    #summaryGrid .k { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
-    #summaryGrid .v { font-size: 1rem; font-weight: 600; }
+    #summaryGrid .k { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; }
+    #summaryGrid .v { color: var(--text); font-size: 1rem; font-weight: 600; overflow-wrap: anywhere; }
     .hidden { display: none; }
+    #warningList { list-style: none; margin: 0; padding: 0; }
+    .warning { display: flex; gap: .6rem; padding: .6rem .7rem; border-bottom: 1px solid var(--border); border-left: 4px solid var(--border-strong); font-size: .9rem; }
+    .warning:last-child { border-bottom: none; }
+    .warning strong { min-width: 4.5rem; }
+    .warning-error { border-left-color: var(--error); }
+    .warning-high { border-left-color: var(--high); }
+    .warning-medium { border-left-color: var(--warning); }
+    .warning-low { border-left-color: var(--onshape); }
+    .warning-info { border-left-color: var(--success); }
+    .warning-error strong { color: var(--error); }
+    .warning-high strong { color: var(--high); }
+    .warning-medium strong { color: var(--warning); }
+    .warning-low strong { color: var(--onshape); }
+    .warning-info strong { color: var(--success); }
+    #cpPicker { margin-top: 1.1rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+    #cpPicker h3 { margin: 0 0 .6rem; font-size: .95rem; }
+    .field-label { display: block; font-size: .78rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: .3rem; }
+    #cpSourceSelect { width: 100%; padding: .5rem .6rem; font: inherit; color: var(--text); background: var(--panel-alt); border: 1px solid var(--border); border-radius: 6px; }
+    .note { margin: .6rem 0 0; font-size: .82rem; line-height: 1.5; color: var(--muted); }
+    .note code { font-size: .95em; }
   </style>
 </head>
 <body>
   <header>
-    <h1>OpenRocket → Onshape</h1>
-    <span class="badge">BETA</span>
+    <h1><span>OpenRocket</span> → Onshape</h1>
   </header>
   <main>
     <section class="card">
-      <h2>Upload .ork file</h2>
-      <p>Select an OpenRocket design file or drag & drop it here. The app parses it locally in your browser — nothing is uploaded until you push to Onshape.</p>
+      <h2>Select .ork file</h2>
+      <p>Select an OpenRocket design file or drag & drop it here. The app parses it locally in your browser; no data is uploaded.</p>
       <div id="dropZone" class="drop">
         <p><b>Drop your .ork file here</b> or click to browse</p>
       </div>
@@ -139,26 +167,34 @@
     <section class="card hidden" id="summaryCard">
       <h2>Parsed Design</h2>
       <div id="summaryGrid"></div>
+      <div class="hidden" id="cpPicker">
+        <h3>Center of pressure</h3>
+        <label class="field-label" for="cpSourceSelect">Take the CP from</label>
+        <select id="cpSourceSelect"></select>
+        <p class="note">
+          This is the <b>simulated</b> CP read from a saved flight — the median of that
+          simulation's <code>CP location</code> column, dropping launch-rod and post-landing rows and
+          anything below Mach 0.05. It is <b>not</b> the static CP that OpenRocket's design view draws:
+          that one is the worst case over 360 roll angles at Mach 0.3 and zero angle of attack, and it
+          can sit tens of millimetres forward of this number.
+        </p>
+      </div>
     </section>
 
+    <section class="card hidden" id="warningsCard">
+      <h2>Validation Warnings</h2>
+      <ul id="warningList"></ul>
+    </section>
     <section class="card hidden" id="outputCard">
       <h2>Generated JSON</h2>
       <p>This JSON is what the Onshape custom feature expects.</p>
       <pre id="jsonOutput"></pre>
-      <div class="row">
+      <div class="row output-actions">
         <button id="downloadBtn" class="secondary">Download JSON</button>
+        <label class="checkbox-label"><input type="checkbox" id="autoDownloadInput" /> Automatically download when no blocking warnings</label>
       </div>
     </section>
 
-    <section class="card hidden" id="onshapeCard">
-      <h2>Upload to Onshape</h2>
-      <p>Provide your Onshape API credentials (OAuth2 bearer token) to create a document from this rocket.</p>
-      <div class="row">
-        <input type="password" id="tokenInput" placeholder="Onshape Bearer Token" style="flex:1; padding:0.5rem; border-radius:6px; border:1px solid var(--border); background:#18182b; color:var(--text);" />
-        <button id="uploadBtn">Upload to Onshape</button>
-      </div>
-      <div id="uploadStatus" class="status"></div>
-    </section>
   </main>
   <script type="module" src="/src/main.ts"></script>
 </body>
