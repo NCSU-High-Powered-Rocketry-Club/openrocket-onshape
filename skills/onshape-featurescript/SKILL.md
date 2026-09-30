@@ -342,10 +342,20 @@ Each of these produced a wrong model or a compile error that looked like a logic
   error even inside a `canBeQuery` guard.
 - **Constrain to the projected copy, never the external curve**, or the face
   closes with micro-gaps.
-- **`opPattern` only *adds* the extra instances**; the source bodies stay put.
-  So pass `instanceCount - 1` transforms and the total visible is `instanceCount`.
-  For an assembly with no body of its own, pattern the **children** and return
-  only the patterned copies.
+- **`opPattern` only *adds* the extra instances**; the source bodies stay put
+  (it re-parents them, which is why std deletes its pattern seeds with an
+  explicit `opDeleteBodies` afterwards). So pass `instanceCount - 1` transforms
+  and the total visible is `instanceCount`. For an assembly with no body of its
+  own, pattern the **children** and return only the patterned copies.
+- **A returned query is not the whole component, and it is not only "everything
+  under this node" either.** An assembly that returns only its pattern copies has
+  silently dropped its ORIGINAL instance. But the obvious fix — append it to the
+  returned query — is a trap: that same value is handed back to the parent as
+  `children` and becomes its **pattern source**, so the original gets instanced a
+  second time and the geometry moves. Carry the originals in a *separate*
+  per-subtree accumulator that only the consumer reads. Symptom of the first bug:
+  one instance missing from a part/assembly. Symptom of the second: instances
+  doubled and displaced, which reads as a placement bug.
 - **Never call `opPattern` with an empty entity set** — guard with `canBeQuery`
   or a count. It silently produces nothing.
 - **Rotate instances about the ASSEMBLY axis, not the part's own axis.** A body of

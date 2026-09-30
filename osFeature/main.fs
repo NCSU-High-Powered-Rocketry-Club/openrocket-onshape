@@ -299,7 +299,10 @@ function createComponents(context is Context, components is array, parentInfo is
                     "bodyTubeRadius" : parentInfo.bodyTubeRadius,
                     // Set once at depth 0, then INHERITED; recomputing it per level
                     // drops the marker entirely (note 8).
-                    "isFirstTopComponent" : parentInfo.isFirstTopComponent == true || (depth == 0 && i == 0)
+                    "isFirstTopComponent" : parentInfo.isFirstTopComponent == true || (depth == 0 && i == 0),
+                    // A FRESH array per component, so the original instances collected
+                    // below it belong to this subtree alone (note 34).
+                    "assemblyOriginals" : []
                 },
                 "topPosition" : topPosition,
                 "lastPosition" : lastPosition
@@ -421,13 +424,27 @@ function createComponents(context is Context, components is array, parentInfo is
             componentQueryArray = append(componentQueryArray, makeRobustQuery(context, childrenQuery));
         }
 
+        // A patterned assembly's ORIGINAL instance is `children`; it goes in the
+        // accumulator, never the return value, which is a pattern source (note 34).
+        if (isAssembly(comp['type']) && effectiveInstanceCount(comp) > 1 && size(children) > 0)
+        {
+            // The depth-0 call is made with a hand-built map that has no field yet.
+            if (parentInfo.assemblyOriginals == undefined)
+            {
+                parentInfo.assemblyOriginals = [];
+            }
+
+            parentInfo.assemblyOriginals = append(parentInfo.assemblyOriginals, children);
+        }
+
         // The mate connectors are created above, before the empty-body `continue`
         // (note 20).
 
         if (depth == 1)
         {
             const compositePartId = compId + "composite";
-            var compositeBodies = qUnion([qUnion(children), bodies]);
+            // The originals the recursion collected, which no pattern ever sees.
+            var compositeBodies = qUnion([qUnion(children), bodies, qUnion(parentInfo.assemblyOriginals)]);
 
             // The CP marker rides on the FIRST top-level component's composite
             // part, not on every stage's (note 8).
@@ -1520,6 +1537,29 @@ function isAssembly(compType is string) returns boolean
     return compType == "podset" || compType == "parallelstage";
 }
 
+/** How many instances `completeComponent` will build for `comp`.  Mirrors the fin
+ *  overrides it applies, so a caller cannot disagree with it (notes 33, 34). */
+function effectiveInstanceCount(comp is map) returns number
+{
+    const compType = comp['type'];
+
+    if (compType == "ellipticalfinset" || compType == "trapezoidfinset"
+        || compType == "freeformfinset" || compType == "tubefinset")
+    {
+        if (comp.params != undefined && comp.params.finCount != undefined)
+        {
+            return comp.params.finCount;
+        }
+    }
+
+    if (comp.position != undefined && comp.position.instanceCount != undefined)
+    {
+        return comp.position.instanceCount;
+    }
+
+    return 1;
+}
+
 // OpenRocket's LineInstanceable types: instances stack along the axis, not round it (note 33).
 function isLineInstanceable(compType is string) returns boolean
 {
@@ -2474,4 +2514,79 @@ function resolveMaterial(componentMaterial)
  *     step with the upstream type list, and so that a type added here later has
  *     to be argued for against the hierarchy rather than matched by name
  *     inline at the call site.
+ *
+ * 34. Why a PATTERNED assembly hands up its ORIGINAL children as well
+ *
+ *     A pod set's first instance was missing from its parent's composite part,
+ *     and only its first: every copy was there.  The whole chain is in what a
+ *     level hands back to its caller, and nothing about the geometry is wrong.
+ *
+ *     `completeComponent` returns, for an assembly, only the bodies `opPattern`
+ *     CREATED (note 3).  That is deliberate rather than an oversight -- the
+ *     caller applies NAME and APPEARANCE to whatever comes back, and a pod's
+ *     children have to keep their own names, which is what the `!isAssembly`
+ *     guard on the property block is for.  The originals are therefore absent
+ *     from `bodies` BY DESIGN, and something else has to supply them.
+ *
+ *     Two candidates existed, and both are wrong:
+ *
+ *       - The `childrenQuery` re-read, which is what a non-assembly uses.  It
+ *         is skipped for assemblies, correctly, because `bodies` for an assembly
+ *         already IS its children and adding the query again would list each
+ *         child twice in the composite part, which Onshape rejects (note 25).
+ *         For a PATTERNED assembly it would have been wrong twice over: the
+ *         pattern consumed those bodies, so the re-read evaluates to zero.
+ *
+ *       - `qCreatedBy(patternId, EntityType.BODY)`, which is the copies again --
+ *         the thing that was already working, and the reason only the original
+ *         went missing.
+ *
+ *     What is left is the array `children`, evaluated at the top of the second
+ *     loop, BEFORE `completeComponent` ran and so before the pattern consumed
+ *     anything.  A held array of entity references stays valid across the
+ *     pattern: `opPattern` re-parents its source bodies under the new feature
+ *     rather than deleting them, which is why std deletes its pattern seeds
+ *     with an explicit `opDeleteBodies` afterwards (`sheetMetalPattern.fs`,
+ *     `patternSeeds`) -- they are still there and have to be removed on purpose.
+ *     So the pre-pattern array is the only handle on the original instance, and
+ *     appending it is what puts the first pod into the composite part.
+ *
+ *     The `instanceCount > 1` test is what separates the two assembly cases,
+ *     and it is load-bearing for the duplicate reason given above:
+ *
+ *       - A single-instance assembly never reaches the pattern branch, so its
+ *         `bodies` IS its children and appending them again would double them.
+ *       - A patterned assembly's `bodies` are the COPIES, a set disjoint from
+ *         the originals, so the union is exactly `instanceCount` instances.
+ *
+ *     Only the composite part was visibly affected, and only for a pod set
+ *     nested BELOW depth 1.  At depth 1 the composite is built directly from the
+ *     pre-pattern `children` array and so always had the original; deeper, that
+ *     array first has to survive the trip up through `componentQueryArray`, and
+ *     that is the step that dropped it.
+ *
+ *     THE TRAP, and why the original does not simply go into the return value: a
+ *     level's return is not only "everything under this node".  It is handed
+ *     straight back to the parent as `children`, and `completeComponent` uses
+ *     that as its PATTERN SOURCE (`patternQuery`) whenever the parent itself
+ *     instances.  An original appended there is instanced a SECOND time by an
+ *     enclosing pod set, and the pods move.  The first attempt at this fix did
+ *     exactly that and a regen showed the pods displaced.
+ *
+ *     So the original travels in a second channel instead.  `assemblyOriginals`
+ *     is a FRESH array per component, put in the child's `parentInfo`, which the
+ *     recursion fills and the parent's composite part reads.  Two properties make
+ *     it safe, and both are the reason it is a separate array rather than a
+ *     shared one:
+ *
+ *       - It is never a pattern source.  `componentQueryArray` -- the only value
+ *         that reaches `patternQuery` -- is left exactly as it was.
+ *       - It is per SUBTREE, so a sibling pod's originals cannot land in this
+ *         component's composite part, and no body is listed twice, which Onshape
+ *         rejects (note 25).
+ *
+ *     The composite part therefore takes `children`, the component's own `bodies`
+ *     and the collected originals, which for a two-instance pod set is both
+ *     instances whatever the nesting.
+ *
  */
